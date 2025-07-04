@@ -37,6 +37,7 @@ def build_hidden_layer(num_inputs=784, num_hidden=100):
         neuron = LIF(
             firing_threshold=1.0,
             leak_alpha=0.9,
+            output_leak_alpha=0.9,
             connections=connections,
             output_size=10, 
             learning_rate=0.01
@@ -45,7 +46,12 @@ def build_hidden_layer(num_inputs=784, num_hidden=100):
     return hidden_neurons
 
 def build_output_layer(num_outputs=10):
-    return SoftmaxOutputLayer(num_outputs=num_outputs, leak_alpha=0.9)
+    return SoftmaxOutputLayer(
+        num_hidden=100,
+        num_outputs=num_outputs,
+        learning_rate=0.01,
+        leak_alpha=0.9
+    )
 
 def run_single_image(image, label, hidden, output_layer, duration=100):
     spikes = poisson_encode(image, duration=duration)
@@ -53,34 +59,34 @@ def run_single_image(image, label, hidden, output_layer, duration=100):
 
     for t in range(duration):
         # Feed input spikes to hidden layer
-        for pre_idx in range(784):
-            if spikes[t, pre_idx]:
-                for h in hidden:
-                    h.recieve_pulse(pre_idx)
+        if t < duration:
+            for pre_idx in range(784):
+                if spikes[t, pre_idx]:
+                    for h in hidden:
+                        h.recieve_pulse(pre_idx)
 
         # Hidden neuron update
-        for h in hidden:
+        for i, h in enumerate(hidden):
             h.next_time_step()
             if h.sending_pulse:
                 for j in range(output_layer.num_outputs):
-                    
-                    output_layer.receive_pulse(j, h.loss_weights[j])
+                    output_layer.receive_pulse(i)
 
         # Update output layer
         output_layer.update()
 
-    # Compute error (cross-entropy gradient)
-    error_signal = output_layer.compute_error(label)
+        # Compute error (cross-entropy gradient)
+        error_signal = output_layer.compute_error(label)
+        # Feedback error to hidden layer
+        for h in hidden:
+            h.recieve_error(error_signal)
+        output_layer.accumulate_gradient(error_signal)
 
-    # print(output_layer.membrane_potentials)
-    # print("Label", label,", p: ", output_layer.output()[label])
+        # print(output_layer.membrane_potentials)
+        # print("Label", label,", p: ", output_layer.output()[label])
 
     # Accumulate spike count for output prediction
     spike_counts += output_layer.output()
-
-    # Feedback error to hidden layer
-    for h in hidden:
-        h.recieve_error(error_signal)
 
     # Update LIF weights
     for h in hidden:
@@ -99,6 +105,7 @@ def train(hidden, output, images, labels, epochs=1):
             pred = np.argmax(spike_counts)
             i += 1
             if i%10== 0:
+                output.update_parameters()
                 for h in hidden:
                     h.update_parameters()
             if pred == lbl:
@@ -112,4 +119,4 @@ images, labels = load_mnist(n_samples=1000)
 print(labels)
 hidden = build_hidden_layer()
 output = build_output_layer()
-train(hidden, output, images, labels, epochs=50)
+train(hidden, output, images, labels, epochs=500)
