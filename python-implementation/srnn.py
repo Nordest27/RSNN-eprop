@@ -1,3 +1,4 @@
+#Default Parameters gotten from https://github.com/ChFrenkel/eprop-PyTorch/blob/main/main.py
 import numpy as np
 
 
@@ -20,20 +21,23 @@ class LIF:
         self.time_step = 0
 
     def __init__(
-            self, 
-            firing_threshold: float, 
-            leak_alpha: float,
-            output_leak_alpha: float,
+            self,
             connections: dict,
             output_size: int,
+            firing_threshold: float = 0.6, 
             learning_rate: float = 0.01,
-            pseudo_derivative_slope: float = 0.3
+            pseudo_derivative_slope: float = 0.3,
+            connected_to_output: bool = True,
+            tau=2000e-3, # 'Membrane potential leakage time constant in the recurrent layer (in seconds)'
+            tau_out=20e-2, # 'Membrane potential leakage time constant in the output layer (in seconds)'
+            dt=1e-3
     ):
         self.firing_threshold = firing_threshold
-        self.leak_alpha = leak_alpha
-        self.output_leak_alpha = output_leak_alpha
+        self.alpha    = np.exp(-dt/tau)
+        self.kappa    = np.exp(-dt/tau_out)
         self.learning_rate = learning_rate
         self.pseudo_derivative_slope = pseudo_derivative_slope
+        self.connected_to_output = connected_to_output
         
         sorted_keys = sorted(connections.keys())
         self.connections_idx = np.array(sorted_keys)
@@ -63,13 +67,15 @@ class LIF:
         )
 
     def recieve_pulse(self, idx: int):
+        if idx not in self.connections_idx:
+            return
         arr_idx = self.connections_idx.searchsorted(idx)
         self.accumulated_input += self.connections_w[arr_idx]
         self.el_vec_input[arr_idx] = 1
     
     def next_time_step(self):
         self.membrane_potential = (
-            self.membrane_potential * self.leak_alpha
+            self.membrane_potential * self.alpha
             + self.accumulated_input
             - self.firing_threshold * self.sending_pulse
         )
@@ -77,11 +83,11 @@ class LIF:
             self.membrane_potential - self.firing_threshold
         )
         self.eligibility_vector = (
-            self.eligibility_vector * self.leak_alpha 
+            self.eligibility_vector * self.alpha 
             + self.el_vec_input
         )
         self.low_pass_eligibility_traces = (
-            self.low_pass_eligibility_traces * self.output_leak_alpha
+            self.low_pass_eligibility_traces * self.kappa
             + self.eligibility_vector * self.h_pseudo_derivative()
         )
         self.accumulated_input = 0
@@ -184,12 +190,13 @@ class SoftmaxOutputLayer:
             num_hidden: int, 
             num_outputs: int, 
             learning_rate: float = 0.01,
-            leak_alpha: float = 0.5
+            tau_out=20e-2, # 'Membrane potential leakage time constant in the output layer (in seconds)'
+            dt=1e-3
         ):
         self.num_outputs = num_outputs
         self.num_hidden = num_hidden
         self.learning_rate = learning_rate
-        self.leak_alpha = leak_alpha
+        self.kappa    = np.exp(-dt/tau_out)
 
         # Weight matrix and bias
         self.weights = np.random.normal(0, 0.1, size=(num_outputs, num_hidden))
@@ -214,7 +221,7 @@ class SoftmaxOutputLayer:
     def update(self):
         # Leaky integration of input
         self.membrane_potentials = (
-            self.leak_alpha * self.membrane_potentials 
+            self.kappa * self.membrane_potentials 
             # + self.input
             + self.weights @ self.input_spikes +
             + self.bias
