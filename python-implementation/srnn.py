@@ -2,9 +2,6 @@
 import numpy as np
 import scipy.sparse as sp
 
-import numpy as np
-import scipy.sparse as sp
-
 class LIFLayer:
     def reset(self):
         self.membrane_potentials = np.zeros(self.num_neurons)
@@ -12,20 +9,17 @@ class LIFLayer:
         self.sending_pulses = np.zeros(self.num_neurons, dtype=bool)
         self.refractory_periods = np.zeros(self.num_neurons, dtype=int)
         
-        self.eligibility_vectors = np.zeros((self.num_neurons, self.num_inputs))
-        self.low_pass_eligibility_traces = np.zeros((self.num_neurons, self.num_inputs))
-        self.el_vec_inputs = np.zeros((self.num_neurons, self.num_inputs))
+        self.eligibility_vectors = np.zeros((self.num_neurons, self.num_total_inputs))
+        self.low_pass_eligibility_traces = np.zeros((self.num_neurons, self.num_total_inputs))
+        self.el_vec_inputs = np.zeros((self.num_neurons, self.num_total_inputs))
         self.learning_signals = np.zeros(self.num_neurons)
         self.time_step = 0
-        
-        # Reset weight updates
-        self.weight_updates = sp.csr_matrix((self.num_neurons, self.num_inputs))
-        # self.batch_size += 1
 
     def __init__(
         self,
         num_inputs: int,
         num_neurons: int,
+        batch_size: int,
         firing_threshold: float = 0.6,
         learning_rate: float = 0.01,
         pseudo_derivative_slope: float = 0.3,
@@ -33,9 +27,14 @@ class LIFLayer:
         tau=2000e-3,
         tau_out=20e-2,
         dt=1e-3,
-        output_size: int = 1
+        output_size: int = 1,
+        # Adam optimizer parameters
+        beta1: float = 0.9,
+        beta2: float = 0.999,
+        epsilon: float = 1e-8
     ):
-        self.num_inputs = num_inputs
+        self.num_total_inputs = num_inputs + num_neurons
+
         self.num_neurons = num_neurons
         self.firing_threshold = firing_threshold
         self.learning_rate = learning_rate
@@ -43,16 +42,29 @@ class LIFLayer:
         self.alpha = np.exp(-dt / tau)
         self.kappa = np.exp(-dt / tau_out)
         
+        # Adam optimizer parameters
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.epsilon = epsilon
+        
         # Initialize sparse weight matrix
-        weight_mask = sp.random(num_neurons, num_inputs, density=connection_density, format='csr')
+        weight_mask = sp.random(num_neurons, self.num_total_inputs, density=connection_density, format='csr')
+
         weight_values = np.random.normal(0, 0.1, size=weight_mask.nnz)
         self.weights = sp.csr_matrix((weight_values, weight_mask.indices, weight_mask.indptr),
-                                   shape=(num_neurons, num_inputs))
+                                   shape=(num_neurons, self.num_total_inputs))
+        self.weight_updates = sp.csr_matrix((self.num_neurons, self.num_total_inputs))
         
-        self.loss_weights = sp.random(num_neurons, output_size, density=0.1, format='csr')
+        self.loss_weights = abs(sp.random(num_neurons, output_size, density=1.0, format='csr'))
+        
         # Initialize accumulated weight updates as sparse matrix
-        self.accumulated_weight_updates = sp.csr_matrix((num_neurons, num_inputs))
-        # self.batch_size = -1
+        self.accumulated_weight_updates = sp.csr_matrix((num_neurons, self.num_total_inputs))
+        self.batch_size = batch_size
+        
+        # Initialize Adam optimizer state
+        self.adam_step = 0
+        self.m_weights = sp.csr_matrix((num_neurons, self.num_total_inputs))
+        self.v_weights = sp.csr_matrix((num_neurons, self.num_total_inputs))
         
         self.reset()
 
@@ -84,15 +96,8 @@ class LIFLayer:
         return derivatives
 
     def receive_pulse(self, spike_vector: np.ndarray):
-        """
-        Accept a sparse (or dense) binary vector of incoming spikes
-        spike_vector shape: [num_inputs]
-        """
-        # Ensure spike_vector is a row vector
-        if spike_vector.shape[0] != 1:
-            spike_vector = spike_vector.reshape(1, -1)
         # Matrix multiplication: weights @ spike_vector.T
-        input_effects = self.weights @ spike_vector.T
+        input_effects = self.weights * spike_vector.T
         input_effects = np.asarray(input_effects.todense()).reshape(-1) 
         # Get active indices
         active_indices = spike_vector.nonzero()[1]
@@ -110,9 +115,9 @@ class LIFLayer:
         )
         
         # Determine which neurons are firing
-        self.sending_pulses = self.heavy_side_step_function(
+        self.sending_pulses = np.multiply(self.heavy_side_step_function(
             self.membrane_potentials - self.firing_threshold
-        )
+        ), self.refractory_periods == 0)
         
         # Update eligibility vectors
         self.eligibility_vectors = (
@@ -148,29 +153,66 @@ class LIFLayer:
         # Compute learning signal for each neuron
         self.learning_signals = self.loss_weights @ errors
         
-        # Accumulate weight updates using eligibility traces
-        weight_updates_dense = self.learning_signals[:, np.newaxis] * self.low_pass_eligibility_traces
+        # Efficiently compute weight updates using sparse structure
+        # Only compute updates for existing connections
+        rows, cols = self.weights.nonzero()
         
-        # Convert to sparse and accumulate
-        weight_updates_sparse = sp.csr_matrix(weight_updates_dense)
-        # Only update weights that exist (multiply by weight mask)
-        self.accumulated_weight_updates += weight_updates_sparse.multiply(self.weights != 0)
+        # Compute updates only for existing weights
+        weight_update_values = (
+            self.learning_signals[rows] * 
+            self.low_pass_eligibility_traces[rows, cols]
+        )
+        
+        # Create sparse matrix directly from the computed values
+        weight_updates_sparse = sp.csr_matrix(
+            (weight_update_values, (rows, cols)), 
+            shape=(self.num_neurons, self.num_total_inputs)
+        )
+        
+        # Accumulate weight updates
+        self.accumulated_weight_updates += weight_updates_sparse
 
     def update_parameters(self):
-        """Apply accumulated weight updates"""
-        # if self.batch_size == 0:
-        #     return
+        """Apply accumulated weight updates using Adam optimizer"""
+        if self.accumulated_weight_updates.nnz == 0:
+            return
             
-        lr_scaled = self.learning_rate 
-        # / self.batch_size
-
+        # Scale gradients by batch size
+        gradients = self.accumulated_weight_updates / self.batch_size
+        
+        # Increment Adam step counter
+        self.adam_step += 1
+        
+        # Update biased first moment estimate (momentum)
+        self.m_weights = self.beta1 * self.m_weights + (1 - self.beta1) * gradients
+        
+        # Update biased second moment estimate (RMSprop)
+        self.v_weights = self.beta2 * self.v_weights + (1 - self.beta2) * gradients.multiply(gradients)
+        
+        # Bias correction
+        m_hat = self.m_weights / (1 - self.beta1 ** self.adam_step)
+        v_hat = self.v_weights / (1 - self.beta2 ** self.adam_step)
+        
+        # Convert v_hat to dense for sqrt operation, then back to sparse
+        v_hat_dense = v_hat.toarray()
+        v_hat_sqrt = np.sqrt(v_hat_dense) + self.epsilon
+        v_hat_sqrt_sparse = sp.csr_matrix(v_hat_sqrt)
+        
+        # Compute Adam update
+        # We need to do element-wise division for sparse matrices
+        # Convert to dense for the division operation
+        m_hat_dense = m_hat.toarray()
+        update_dense = self.learning_rate * m_hat_dense / v_hat_sqrt
+        update_sparse = sp.csr_matrix(update_dense)
+        
+        # Only update weights that exist (multiply by weight mask)
+        masked_update = update_sparse.multiply(self.weights != 0)
         
         # Update weights
-        self.weights = self.weights - self.accumulated_weight_updates.multiply(lr_scaled)
+        self.weights = self.weights - masked_update
         
         # Reset accumulated updates
-        self.accumulated_weight_updates = sp.csr_matrix((self.num_neurons, self.num_inputs))
-        # self.batch_size = 0
+        self.accumulated_weight_updates = sp.csr_matrix((self.num_neurons, self.num_total_inputs))
 
     def get_output_spikes(self):
         """Return current spike outputs as sparse matrix"""
@@ -186,6 +228,18 @@ class LIFLayer:
     def get_output_spikes_dense(self):
         """Return current spike outputs as dense array"""
         return self.sending_pulses.astype(float)
+    
+    def get_adam_stats(self):
+        """Return current Adam optimizer statistics for debugging"""
+        return {
+            'step': self.adam_step,
+            'beta1': self.beta1,
+            'beta2': self.beta2,
+            'epsilon': self.epsilon,
+            'lr': self.learning_rate,
+            'm_weights_nnz': self.m_weights.nnz,
+            'v_weights_nnz': self.v_weights.nnz
+        }
     
 # class ReadoutNeuron:
 #     def __init__(self, output_bias: float, leak_alpha: float):
