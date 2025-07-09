@@ -1,20 +1,20 @@
 import numpy as np
 import scipy.sparse as sp
-from srnn import LIFLayer, SoftmaxOutputLayer  # Updated import
+from srnn import LIFLayer, ALIFLayer, SoftmaxOutputLayer  # Updated import
 from visualize import SRNNVisualizer
 import torchvision
 import torchvision.transforms as transforms
 from tqdm import tqdm
 
 
-def poisson_encode(image: np.ndarray, duration=100):
+def poisson_encode(image: np.ndarray, duration=100, max_prob=0.25):
     """
     Convert an image to a binary spike train over time.
     image: 28x28 pixel values [0, 1]
     returns: (duration, 784) spike train
     """
     flat_image = image.flatten()
-    spike_probs = flat_image / max(flat_image*np.sqrt(duration))
+    spike_probs = max_prob*flat_image / (max(flat_image))
     spikes = np.random.rand(duration, 784) < spike_probs
     return spikes
 
@@ -94,18 +94,28 @@ def load_mnist(n_samples=1000):
         labels.append(lbl)
     return np.array(images), np.array(labels)
 
-def build_hidden_layer(num_inputs=784, num_hidden=100, connection_density=0.05, batch_size=5):
+def build_hidden_layer(
+    num_inputs=784, 
+    num_hidden=100,
+    input_connection_density=0.1,
+    local_connection_density=0.05, 
+    batch_size=5
+):
     """
     Build a hidden layer using LIFLayer instead of individual LIF neurons.
     Total input size includes both external inputs and recurrent connections.
     """
-    hidden_layer = LIFLayer(
-        num_inputs=num_inputs,
+    hidden_layer = ALIFLayer(
+        just_input_size=num_inputs,
+        num_inputs=num_inputs + num_hidden,
         num_neurons=num_hidden,
         learning_rate=1e-3,
-        connection_density=connection_density,
+        input_connection_density=input_connection_density,
+        local_connection_density=local_connection_density,
         output_size=10,
-        batch_size=batch_size
+        batch_size=batch_size,
+        firing_threshold=0.6,
+        beta=0
     )
     
     return hidden_layer
@@ -114,15 +124,15 @@ def build_output_layer(num_outputs=10, num_hidden=100, connection_density=0.05):
     return SoftmaxOutputLayer(
         num_hidden=num_hidden,
         num_outputs=num_outputs,
-        learning_rate=1e-3,
-        connection_density=connection_density
+        learning_rate=1e-2,
+        connection_density=connection_density,
     )
 
 def run_single_image(image, label, hidden_layer, output_layer, duration):
     """
     Run a single image through the network.
     """
-    # spikes = poisson_encode(image, duration=duration)
+    # spikes = poisson_encode(image, duration=duration, max_prob=0.1)
     # spikes = freq_encode(image, duration=duration)
     spikes = bucket_encode(image, duration)
     # spikes = bucket_cycle_encode(image, duration)
@@ -147,7 +157,7 @@ def run_single_image(image, label, hidden_layer, output_layer, duration):
             output_layer.receive_pulse(hidden_output)
         
         output_layer.update()
-        
+    
     loss = None
     if label is not None:
         # Compute error and backpropagate
@@ -223,12 +233,12 @@ def test(hidden_layer, output_layer, images, labels, duration):
     print(f"Test Accuracy: {acc:.3f}")
     return acc
 
-def visualize_mnist(image, hidden_layer, duration):
-    # spikes = poisson_encode(image, duration=duration)
+def visualize_mnist(image, label, hidden_layer, output_layer, duration):
+    # spikes = poisson_encode(image, duration=duration, max_prob=0.1)
     # spikes = freq_encode(image, duration=duration)
     spikes = bucket_encode(image, duration)
-    #spikes = bucket_cycle_encode(image, duration)
-    visualizer = SRNNVisualizer(hidden_layer, spikes)
+    # spikes = bucket_cycle_encode(image, duration)
+    visualizer = SRNNVisualizer(hidden_layer, spikes, output_layer)
     visualizer.animate(interval=10)
 
 # Main execution
@@ -246,13 +256,18 @@ if __name__ == "__main__":
     
     # Build network
     print("Building network...")
-    hidden_layer = build_hidden_layer(num_hidden=n_hidden, connection_density=0.1, batch_size=batch_size)
+    hidden_layer = build_hidden_layer(
+        num_hidden=n_hidden, 
+        input_connection_density=0.3,
+        local_connection_density=0.5, 
+        batch_size=batch_size
+    )
     output_layer = build_output_layer(num_hidden=n_hidden, connection_density=0.3)
     
     # Train network
     print("Training network...")
     train(hidden_layer, output_layer, train_images, train_labels, 
-          epochs=100, batch_size=batch_size, duration=duration)
+          epochs=25, batch_size=batch_size, duration=duration)
     
     # Test on training data (you should use separate test data in practice)
     print("Testing network...")
@@ -260,4 +275,11 @@ if __name__ == "__main__":
 
     print("Visualizing")
     while input("Visualize?"):
-        visualize_mnist(train_images[np.random.randint(len(train_images))], hidden_layer, 1000)
+        i = np.random.randint(len(test_images))
+        visualize_mnist(
+            test_images[i],
+            test_images[i],
+            hidden_layer, 
+            output_layer, 
+            1000
+        )
