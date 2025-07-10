@@ -4,7 +4,7 @@ import matplotlib.animation as animation
 from matplotlib.patches import Circle 
 import scipy.sparse as sp
 import time
-from srnn import LIFLayer, SoftmaxOutputLayer
+from srnn import ALIFLayer, SoftmaxOutputLayer
 
 class SRNNVisualizer:
     def __init__(self, lif_layer, input_data, output_layer=None, target_data=None, figsize=(18, 12)):
@@ -293,14 +293,14 @@ class SRNNVisualizer:
         
         # Run the actual LIF layer computation
         self.lif_layer.receive_pulse(input_sparse)
-        self.lif_layer.next_time_step()
+        # self.lif_layer.next_time_step()
         
         # Process output layer if present
         if self.output_layer is not None:
             hidden_output = self.lif_layer.get_output_spikes()
             if hidden_output.nnz > 0:
                 self.output_layer.receive_pulse(hidden_output)
-            self.output_layer.update()
+            # self.output_layer.update()
             
             # Store output probabilities
             output_probs = self.output_layer.output()
@@ -463,14 +463,12 @@ def create_demo_visualization():
     n_outputs = 3
     
     # Create a small LIF layer for demonstration
-    lif_layer = LIFLayer(
+    lif_layer = ALIFLayer(
+        just_input_size=n_inputs,
         num_inputs=n_inputs,
         num_neurons=n_hidden,
-        batch_size=1,
-        firing_threshold=0.6,
-        learning_rate=0.001,
-        connection_density=0.5,
-        output_size=n_outputs
+        output_size=n_outputs,
+        batch_size=1
     )
     
     # Create output layer

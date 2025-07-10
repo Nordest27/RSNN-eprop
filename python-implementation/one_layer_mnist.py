@@ -1,6 +1,6 @@
 import numpy as np
 import scipy.sparse as sp
-from srnn import LIFLayer, ALIFLayer, SoftmaxOutputLayer  # Updated import
+from srnn import ALIFLayer, SoftmaxOutputLayer 
 from visualize import SRNNVisualizer
 import torchvision
 import torchvision.transforms as transforms
@@ -115,9 +115,15 @@ def build_hidden_layer(
         output_size=10,
         batch_size=batch_size,
         firing_threshold=0.6,
-        beta=0
+        # fixed_dt=1e-3,
+        beta="sparse_adaptive",
+        beta_params={
+            "lif_fraction": 0.6,  # Fraction of LIF neurons
+            "exp_scale": 0.2,    # Scale parameter for exponential distribution
+            "max_beta": 2.0      # Maximum beta value
+        }
     )
-    
+    print(hidden_layer.analyze_beta_distribution())
     return hidden_layer
 
 def build_output_layer(num_outputs=10, num_hidden=100, connection_density=0.05):
@@ -126,6 +132,7 @@ def build_output_layer(num_outputs=10, num_hidden=100, connection_density=0.05):
         num_outputs=num_outputs,
         learning_rate=1e-2,
         connection_density=connection_density,
+        # fixed_dt=1e-3,
     )
 
 def run_single_image(image, label, hidden_layer, output_layer, duration):
@@ -140,7 +147,6 @@ def run_single_image(image, label, hidden_layer, output_layer, duration):
     spikes_shape = spikes.shape
     spikes = sp.csr_matrix(spikes, shape=spikes_shape)
     # Initialize output spike counts
-    spike_counts = np.zeros(output_layer.num_outputs)
     hidden_output = hidden_layer.get_output_spikes()
     for t in range(duration):
         input_spike_vector = sp.hstack([
@@ -149,14 +155,14 @@ def run_single_image(image, label, hidden_layer, output_layer, duration):
         ])
         # Feed input to hidden layer
         hidden_layer.receive_pulse(input_spike_vector)
-        hidden_layer.next_time_step()
+        # hidden_layer.next_time_step()
         
         # Get hidden layer output and feed to output layer
         hidden_output = hidden_layer.get_output_spikes()
-        if hidden_output.nnz > 0:  # Only if there are spikes
-            output_layer.receive_pulse(hidden_output)
+        # if hidden_output.nnz > 0:  # Only if there are spikes
+        output_layer.receive_pulse(hidden_output)
         
-        output_layer.update()
+        # output_layer.update()
     
     loss = None
     if label is not None:

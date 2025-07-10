@@ -1,12 +1,158 @@
-#Default Parameters gotten from https://github.com/ChFrenkel/eprop-PyTorch/blob/main/main.py
 import numpy as np
 import scipy.sparse as sp
-import multiprocessing as mp
-
-import numpy as np
-import scipy.sparse as sp
+import time
 
 class ALIFLayer:
+    
+    def initialize_beta_distribution(self, beta, num_neurons, beta_hyperparams=None):
+        """
+        Initialize beta parameter with various distributions
+        
+        Args:
+            beta: str or float specifying distribution type
+            num_neurons: number of neurons in the layer
+            beta_hyperparams: dict of hyperparameters for each distribution
+        
+        Returns:
+            numpy array of beta values
+        """
+        
+        # Default hyperparameters for each distribution
+        default_hyperparams = {
+            "randomize": {
+                "max_beta": 0.14
+            },
+            "sparse_adaptive": {
+                "lif_fraction": 0.8,  # Fraction of LIF neurons
+                "exp_scale": 0.05,    # Scale parameter for exponential distribution
+                "max_beta": 0.2       # Maximum beta value
+            },
+            "bimodal": {
+                "adaptive_fraction": 0.3,  # Fraction of adaptive neurons
+                "adaptive_mean": 0.12,     # Mean beta for adaptive population
+                "adaptive_std": 0.02,      # Std dev for adaptive population
+                "max_beta": 0.2            # Maximum beta value
+            },
+            "power_law": {
+                "exponent": 0.5,      # Power law exponent (lower = more skewed)
+                "max_beta": 0.15      # Maximum beta value
+            },
+            "log_normal": {
+                "mean": -3.0,         # Mean of underlying normal distribution
+                "sigma": 0.8,         # Standard deviation of underlying normal
+                "max_beta": 0.2       # Maximum beta value
+            },
+            "structured": {
+                "transition_point": 0.8,  # Where sigmoid transition occurs (fraction of neurons)
+                "steepness": 0.01,        # Steepness of sigmoid transition
+                "max_beta": 0.15          # Maximum beta value
+            },
+            "clusters": {
+                "n_clusters": 4,                        # Number of clusters
+                "cluster_betas": [0.0, 0.05, 0.1, 0.15],  # Beta values for each cluster
+                "noise_std": 0.01,                      # Standard deviation of noise around cluster centers
+                "max_beta": 0.2                         # Maximum beta value
+            },
+            "pareto": {
+                "shape": 1.5,         # Pareto shape parameter (lower = more skewed)
+                "scale": 0.02,        # Scale factor
+                "max_beta": 0.2       # Maximum beta value
+            }
+        }
+        
+        if isinstance(beta, float):
+            return np.array([beta] * num_neurons)
+        
+        # Merge provided hyperparameters with defaults
+        if beta_hyperparams is None:
+            beta_hyperparams = {}
+        params = default_hyperparams.get(beta, {}).copy()
+        params.update(beta_hyperparams)
+        
+        if isinstance(beta, str):
+            np.random.seed()  # Ensure different random seeds across processes
+            
+            if beta == "randomize":
+                # Original uniform distribution
+                return params["max_beta"] * np.random.rand(num_neurons)
+            
+            elif beta == "sparse_adaptive":
+                # Heavy bias toward LIF neurons (beta=0) with few adaptive neurons
+                betas = np.zeros(num_neurons)
+                n_adaptive = int((1 - params["lif_fraction"]) * num_neurons)
+                adaptive_indices = np.random.choice(num_neurons, n_adaptive, replace=False)
+                # Exponential distribution for adaptive neurons
+                betas[adaptive_indices] = np.random.exponential(params["exp_scale"], n_adaptive)
+                return np.clip(betas, 0, params["max_beta"])
+            
+            elif beta == "bimodal":
+                # Two populations: LIF (beta≈0) and strongly adaptive (beta≈0.1-0.15)
+                betas = np.zeros(num_neurons)
+                n_adaptive = int(params["adaptive_fraction"] * num_neurons)
+                adaptive_indices = np.random.choice(num_neurons, n_adaptive, replace=False)
+                # Adaptive neurons have beta around specified mean
+                betas[adaptive_indices] = np.random.normal(
+                    params["adaptive_mean"], 
+                    params["adaptive_std"], 
+                    n_adaptive
+                )
+                return np.clip(betas, 0, params["max_beta"])
+            
+            elif beta == "power_law":
+                # Power law distribution - many low values, few high values
+                betas = np.random.power(params["exponent"], num_neurons) * params["max_beta"]
+                return betas
+            
+            elif beta == "log_normal":
+                # Log-normal distribution - naturally skewed toward low values
+                betas = np.random.lognormal(mean=params["mean"], sigma=params["sigma"], size=num_neurons)
+                return np.clip(betas, 0, params["max_beta"])
+            
+            elif beta == "structured":
+                # Structured assignment based on neuron index
+                indices = np.arange(num_neurons)
+                # Sigmoid-like transition
+                sigmoid_vals = 1 / (1 + np.exp(-params["steepness"] * (indices - params["transition_point"] * num_neurons)))
+                betas = sigmoid_vals * params["max_beta"]
+                return betas
+            
+            elif beta == "clusters":
+                # Create distinct clusters of neurons with different adaptation levels
+                n_clusters = params["n_clusters"]
+                cluster_betas = params["cluster_betas"]
+                
+                # Ensure we have enough cluster beta values
+                if len(cluster_betas) < n_clusters:
+                    # Extend with linearly spaced values
+                    missing = n_clusters - len(cluster_betas)
+                    max_existing = max(cluster_betas)
+                    additional = np.linspace(max_existing + 0.02, params["max_beta"], missing)
+                    cluster_betas = cluster_betas + additional.tolist()
+                
+                cluster_size = num_neurons // n_clusters
+                betas = np.zeros(num_neurons)
+                
+                for i in range(n_clusters):
+                    start_idx = i * cluster_size
+                    end_idx = (i + 1) * cluster_size if i < n_clusters - 1 else num_neurons
+                    # Add some noise around cluster centers
+                    cluster_beta = cluster_betas[i]
+                    noise = np.random.normal(0, params["noise_std"], end_idx - start_idx)
+                    betas[start_idx:end_idx] = cluster_beta + noise
+                
+                return np.clip(betas, 0, params["max_beta"])
+            
+            elif beta == "pareto":
+                # Pareto distribution - classic "80-20" rule
+                betas = (np.random.pareto(params["shape"], num_neurons) + 1) * params["scale"]
+                return np.clip(betas, 0, params["max_beta"])
+            
+            else:
+                raise ValueError(f"Unknown beta distribution: {beta}")
+        
+        else:
+            raise ValueError("Invalid beta parameter type")
+
     def reset(self):
         self.membrane_potentials = np.zeros(self.num_neurons)
         self.sending_pulses = np.zeros(self.num_neurons, dtype=bool)
@@ -21,7 +167,8 @@ class ALIFLayer:
         self.adaptative_eligibility_vector = sp.csr_matrix((self.num_neurons, self.num_inputs))
         self.low_pass_eligibility_traces = sp.csr_matrix((self.num_neurons, self.num_inputs))
         self.learning_signals = np.zeros(self.num_neurons)
-        self.time_step = 0
+        
+        self.last_time = time.time()
 
     def calculate_weight_mask(self):
         """Same as LIF layer - creates sparse connectivity pattern"""
@@ -63,31 +210,37 @@ class ALIFLayer:
         local_connection_density: float = 0.1,
         tau=2000e-3,
         tau_out=20e-2,
-        dt=1e-3,
+        fixed_dt=None,
         output_size: int = 1,
         # ALIF-specific parameters
         tau_adaptation=200e-3,  # Adaptation time constant
-        beta=0.07,  # Adaptation coupling strength
+        beta: float | str = 0.07,  # Adaptation coupling strength
+        beta_params: dict | None = None, 
         # Adam optimizer parameters
         beta1: float = 0.9,
         beta2: float = 0.999,
         epsilon: float = 1e-8
     ):
         assert just_input_size + num_neurons <= num_inputs
+
+        self.fixed_dt = fixed_dt
+
         self.just_input_size = just_input_size
         self.num_inputs = num_inputs
         self.num_neurons = num_neurons
         self.recurrent_start = recurrent_start or (num_inputs - num_neurons)
 
+        self.tau = tau
+        self.tau_out = tau_out
+        self.tau_adaptation = tau_adaptation
+        
         self.firing_threshold = firing_threshold
         self.learning_rate = learning_rate
         self.pseudo_derivative_slope = pseudo_derivative_slope
-        self.alpha = np.exp(-dt / tau)
-        self.kappa = np.exp(-dt / tau_out)
-        
-        # ALIF-specific parameters
-        self.rho = np.exp(-dt / tau_adaptation)  # Adaptation decay factor
-        self.beta = beta  # Adaptation coupling strength
+
+        self.betas = self.initialize_beta_distribution(beta, num_neurons, beta_params)
+        self.betas = self.betas.reshape(1, -1)
+        #self.beta = beta
 
         self.input_connection_density = input_connection_density
         self.hidden_connection_density = hidden_connection_density
@@ -147,49 +300,66 @@ class ALIFLayer:
 
     def receive_pulse(self, spike_vector):
         """Receive input spikes"""
+        dt = time.time() - self.last_time if self.fixed_dt is None else self.fixed_dt
+
+        self.last_time = time.time()
+
+        alpha = np.exp(-dt / self.tau)
+        kappa = np.exp(-dt / self.tau_out)
+        
+        # ALIF-specific parameters
+        rho = np.exp(-dt / self.tau_adaptation)
         self.input_spikes = self.input_spikes.maximum(spike_vector)
 
-    def next_time_step(self):
-        """Update all neurons for one time step - ALIF dynamics"""
+    # def next_time_step(self):
+    #     """Update all neurons for one time step - ALIF dynamics"""
         # Compute effective threshold (base + adaptive component)
         # A_j^t = v_th + βa_t^j
-        self.effective_thresholds = self.firing_threshold + self.beta * self.adaptive_thresholds
+
+        self.effective_thresholds = (
+            self.firing_threshold 
+            + np.ndarray.flatten(self.betas * self.adaptive_thresholds)
+        )
         
         # Update membrane potentials
         self.membrane_potentials = np.asarray(
-            self.membrane_potentials * self.alpha
+            self.membrane_potentials * alpha
             + (self.weights * self.input_spikes.T).T
             - self.effective_thresholds * self.sending_pulses
         ).reshape(-1)
 
         # Determine which neurons are firing (using effective threshold)
         self.sending_pulses = np.multiply(
-            self.heavy_side_step_function(self.membrane_potentials - self.effective_thresholds),
+            self.heavy_side_step_function(
+                self.membrane_potentials - self.effective_thresholds
+            ),
             self.refractory_periods == 0
         )
         
         # Update adaptive thresholds: decay + spike-triggered increase
         self.adaptive_thresholds = (
-            self.adaptive_thresholds * self.rho + self.sending_pulses
+            self.adaptive_thresholds * rho + self.sending_pulses
         )
 
         # Update eligibility vectors
         pseudo_derivatives = self.h_pseudo_derivative()[:, np.newaxis]
         self.low_pass_active_connections = (
-            self.low_pass_active_connections * self.alpha
+            self.low_pass_active_connections * alpha
             + (self.weights != 0).multiply(self.input_spikes)
         )
+
         self.adaptative_eligibility_vector = (
             self.adaptative_eligibility_vector
-            .multiply((self.rho - self.beta * pseudo_derivatives))
+            .multiply(( rho - (self.betas * pseudo_derivatives.reshape(-1)).T ))
             + self.low_pass_active_connections.multiply(pseudo_derivatives)
         )
+
         # Update low-pass eligibility traces
         self.low_pass_eligibility_traces = (
-            self.low_pass_eligibility_traces * self.kappa 
+            self.low_pass_eligibility_traces * kappa 
             + (
               self.low_pass_active_connections 
-              - self.beta * self.adaptative_eligibility_vector
+              - self.adaptative_eligibility_vector.multiply(self.betas.reshape(-1, 1))
             )
             .multiply(pseudo_derivatives) 
         )
@@ -200,11 +370,10 @@ class ALIFLayer:
         # Update refractory periods
         self.refractory_periods = np.where(
             self.sending_pulses, 
-            3,  # Set refractory period to 3 for firing neurons
-            np.maximum(0, self.refractory_periods - 1)  # Decrement for others
+            dt*6,  # Set refractory period to 3 for firing neurons
+            np.maximum(0, self.refractory_periods - dt)  # Decrement for others
         )
 
-        self.time_step += 1
 
     def receive_error(self, errors):
         """Receive error signals and compute learning signals"""
@@ -282,7 +451,7 @@ class ALIFLayer:
     
     def get_effective_thresholds(self):
         """Return current effective thresholds (base + adaptive)"""
-        return self.firing_threshold + self.beta * self.adaptive_thresholds
+        return self.firing_threshold + self.adaptive_thresholds.multiply(self.betas)
     
     def get_adam_stats(self):
         """Return current Adam optimizer statistics for debugging"""
@@ -299,19 +468,34 @@ class ALIFLayer:
     def get_alif_stats(self):
         """Return ALIF-specific statistics"""
         return {
-            'rho': self.rho,
-            'beta': self.beta,
+            'betas': self.betas,
             'mean_adaptive_threshold': np.mean(self.adaptive_thresholds),
             'max_adaptive_threshold': np.max(self.adaptive_thresholds),
             'mean_effective_threshold': np.mean(self.get_effective_thresholds()),
             'active_neurons': np.sum(self.adaptive_thresholds > 0.01)
         }
 
+    # Usage examples and statistics
+    def analyze_beta_distribution(self):
+        """Analyze the properties of a beta distribution"""
+        n_lif = np.sum(self.betas < 0.01)  # Nearly LIF neurons
+        n_adaptive = np.sum(self.betas >= 0.01)  # Adaptive neurons
+        
+        print("\nDistribution Analysis:")
+        print(f"  Total neurons: {self.num_neurons}")
+        print(f"  LIF neurons (β < 0.01): {n_lif} ({(n_lif/self.num_neurons)*100:.1f}%)")
+        print(f"  Adaptive neurons (β ≥ 0.01): {n_adaptive} ({(n_adaptive/self.num_neurons)*100:.1f}%)")
+        print(f"  Mean β: {np.mean(self.betas):.4f}")
+        print(f"  Std β: {np.std(self.betas):.4f}")
+        print(f"  Max β: {np.max(self.betas):.4f}")
+        print(f"  Min β: {np.min(self.betas):.4f}")
+
 class SoftmaxOutputLayer:
     def reset(self):
         self.input_spikes = sp.csr_matrix((1, self.num_hidden))
         self.membrane_potentials = np.zeros(self.num_outputs)
         self.last_spikes = np.zeros(self.num_hidden)
+        self.last_time = time.time()
 
     def __init__(
         self, 
@@ -321,12 +505,15 @@ class SoftmaxOutputLayer:
         learning_rate: float = 0.01,
         connection_density: float = 0.05,  # Fraction of connections present
         tau_out=20e-2,
-        dt=1e-3
+        fixed_dt=None
     ):
+        self.fixed_dt = fixed_dt
+
         self.num_hidden = num_hidden
         self.num_outputs = num_outputs
         self.learning_rate = learning_rate
-        self.kappa = np.exp(-dt / tau_out)
+
+        self.tau_out = tau_out
 
         # Sparse initialization with input_offset: zero out columns < input_offset
         weight_mask = sp.random(num_outputs, num_hidden, density=connection_density, format='csr')
@@ -353,7 +540,12 @@ class SoftmaxOutputLayer:
         assert sparse_spike_vector.shape == (1, self.num_hidden)
         self.input_spikes = self.input_spikes.maximum(sparse_spike_vector)
 
-    def update(self):
+        dt = time.time() - self.last_time if self.fixed_dt is None else self.fixed_dt
+
+        self.last_time = time.time()
+
+        kappa = np.exp(-dt / self.tau_out)
+
         # Convert to dense for single timestep usage
         self.last_spikes = np.zeros(self.num_hidden)
         if self.input_spikes.nnz > 0:
@@ -361,7 +553,7 @@ class SoftmaxOutputLayer:
 
         # Sparse matrix-vector multiplication
         self.membrane_potentials = (
-            self.kappa * self.membrane_potentials
+            kappa * self.membrane_potentials
             + self.weights @ self.last_spikes
             + self.bias
         )
@@ -413,196 +605,3 @@ class SoftmaxOutputLayer:
         self.accumulated_bias_gradients[:] = 0
         self.batch_size = 0
 
-
-class SimpleBroadcastSrnn:
-    def __init__(
-        self, 
-        num_neurons_list, 
-        input_size, output_size, 
-        input_connectivity=0.1,
-        hidden_connectivity=0.01,
-        local_connectivity=0.1,
-        output_connectivity=0.03
-    ):
-        self.num_layers = len(num_neurons_list)
-        self.num_neurons_list = num_neurons_list
-        self.input_size = input_size
-        self.output_size = output_size
-
-        self.input_queues = [mp.Queue() for _ in range(self.num_layers)]
-        self.output_queues = [mp.Queue() for _ in range(self.num_layers)]
-        self.processes = []
-
-        # Assign layer IDs and neuron index ranges
-        self.layer_ids = list(range(self.num_layers))
-        self.layers_offsets = []
-        offset = input_size
-        for n in num_neurons_list:
-            self.layers_offsets.append(offset)
-            offset += n
-        self.total_neurons = offset - input_size
-        self.global_size = input_size + self.total_neurons
-        
-        # Default LIFLayer parameters
-        default_lif_kwargs = dict(
-            just_input_size=input_size,
-            num_inputs=self.global_size,
-            firing_threshold=0.6,
-            learning_rate=0.001,
-            input_connection_density=input_connectivity,
-            hidden_connection_density=hidden_connectivity,
-            local_connection_density=local_connectivity,
-            batch_size=1,
-            output_size=output_size
-        )
-
-        for i in range(self.num_layers):
-            lif_kwargs = dict(default_lif_kwargs)
-            lif_kwargs['num_inputs'] = input_size + self.total_neurons
-            lif_kwargs['num_neurons'] = num_neurons_list[i]
-            p = mp.Process(
-                target=self.lif_worker,
-                args=(
-                    i, 
-                    lif_kwargs, 
-                    self.input_queues[i], 
-                    self.output_queues[i], 
-                    self.layers_offsets[i], 
-                    self.global_size
-                )
-            )
-            p.start()
-            self.processes.append(p)
-
-        num_hidden = sum(num_neurons_list)
-        self.output_layer = SoftmaxOutputLayer(
-            num_hidden=input_size + num_hidden,
-            num_outputs=output_size,
-            learning_rate=0.001,
-            connection_density=output_connectivity,
-            # input_offset=self.layers_offsets[-1]
-        )
-
-    @staticmethod
-    def lif_worker(
-            layer_id, 
-            config, 
-            input_queue, 
-            output_queue, 
-            layer_offset, 
-            global_size
-        ):
-        layer = ALIFLayer(**config, recurrent_start=layer_offset, beta=abs(np.random.random()))
-        while True:
-            instruction, data = input_queue.get()
-            match instruction:
-                case "STOP":
-                    break
-                case "PULSE":
-                    # print("PULSE")
-                    layer.receive_pulse(data)  # expects csr_matrix
-                case "NEXT STEP":
-                    layer.next_time_step()
-                    # Get local spikes
-                    local_spikes = layer.get_output_spikes()
-                    output_spikes = sp.hstack([
-                        sp.csr_matrix((1, layer_offset)),
-                        local_spikes,
-                        sp.csr_matrix((1, global_size - layer_offset - layer.num_neurons))
-                    ])
-                    output_queue.put((layer_id, output_spikes))
-                case "FEEDBACK":
-                    # print("FEEDBACK")
-                    layer.receive_error(data)
-                case "UPDATE":
-                    # print("UPDATE")
-                    layer.update_parameters()
-                case "OUTWEIGHTS":
-                    # print("OUTWEIGHTS")
-                    layer.loss_weights[data.indices] = data[data.indices]
-                case "RESET":
-                    # print("RESET")
-                    layer.reset()
-                case "N_CONNECTIONS":
-                    # Return the number of nonzero weights
-                    output_queue.put(("N_CONNECTIONS", layer.weights.nnz))
-            # time.sleep(0.001)
-
-    def input(self, input_data):
-        # input_data: csr_matrix of shape (1, input_size + total_neurons)
-        for q in self.input_queues:
-            q.put(("PULSE", input_data))
-            q.put(("NEXT STEP", None))
-        # Wait for any layer to finish
-        # ready = [q for q in self.output_queues if not q.empty()]
-        # total_output_spikes = sp.csr_matrix((1, self.global_size))
-        for q in self.output_queues:
-            # idx = self.output_queues.index(ready.pop())
-            # layer_id, output_spikes = self.output_queues[idx].get()
-            output_spikes = q.get()[1]
-            # total_output_spikes = total_output_spikes.maximum(output_spikes)
-            # Broadcast this output to all layers for the next step  
-            for q in self.input_queues:
-                # print("Sending Pulse")
-                q.put(("PULSE", output_spikes))
-            self.output_layer.receive_pulse(output_spikes)
-
-        # self.output_layer.receive_pulse(input_data)
-        self.output_layer.update()
-        # input("input")
-        return self.output_layer.output()
-    
-    def feedback(self, label):
-        errors = self.output_layer.compute_error(label)
-        loss = self.output_layer.compute_loss(label)
-        for q in self.input_queues:
-            q.put(("FEEDBACK", errors))
-        self.output_layer.accumulate_gradient(errors)
-        return loss
-    
-    def update_parameters(self):
-        for q in self.input_queues:
-            q.put(("UPDATE", None))
-        self.output_layer.update_parameters()
-    
-    def update_outweights(self):
-        for i, q in enumerate(self.input_queues):
-            start = self.layers_offsets[i]
-            end = start + self.num_neurons_list[i]
-            out_w = self.output_layer.weights[:, start:end].T  # shape: (layer_size, num_outputs)
-            q.put(("OUTWEIGHTS", out_w))
-    
-    def reset(self):
-        for q in self.input_queues:
-            q.put(("RESET", None))
-        self.output_layer.reset()
-    
-    def shutdown(self):
-    #     for q in self.input_queues:
-    #         q.put(("STOP", None))
-        for p in self.processes:
-            p.terminate()
-        for q in self.input_queues:
-            q.cancel_join_thread()
-        for q in self.output_queues:
-            q.cancel_join_thread()
-
-    def get_n_connections(self):
-        """Query all LIF layers and the output layer for their number of connections."""
-        n_connections = {}
-        total = 0
-        # Ask each LIF layer process
-        for i, q in enumerate(self.input_queues):
-            q.put(("N_CONNECTIONS", None))
-        for i, q in enumerate(self.output_queues):
-            msg_type, n = q.get()
-            assert msg_type == "N_CONNECTIONS"
-            n_connections[f'layer_{i}'] = n
-            total += n
-        # Output layer
-        n_out = self.output_layer.weights.nnz
-        n_connections['output_layer'] = n_out
-        total += n_out
-        n_connections['total'] = total
-        return n_connections
-        

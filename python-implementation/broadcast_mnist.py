@@ -1,6 +1,7 @@
 import numpy as np
 import scipy.sparse as sp
-from srnn import SimpleBroadcastSrnn  # Use the new class
+from simple_broadcast_srnn import SimpleBroadcastSrnn
+from local_broadcast_srnn import LocalBroadcastSrnn
 import torchvision
 import torchvision.transforms as transforms
 from tqdm import tqdm
@@ -95,7 +96,7 @@ def load_mnist(n_samples=1000):
     return np.array(images), np.array(labels)
 
 # --- New run_single_image for broadcasting SRNN ---
-def run_single_image_broadcast(image, label, srnn: SimpleBroadcastSrnn, duration):
+def run_single_image_broadcast(image, label, srnn: LocalBroadcastSrnn | SimpleBroadcastSrnn, duration):
     srnn.reset()
     # spikes = poisson_encode(image, duration=duration, max_prob=0.1)
     # spikes = freq_encode(image, duration=duration)
@@ -108,7 +109,8 @@ def run_single_image_broadcast(image, label, srnn: SimpleBroadcastSrnn, duration
         input_row[0, :input_size] = spikes[t]
         input_csr = sp.csr_matrix(input_row)
         # Step the network
-        output = srnn.input(input_csr)
+        srnn.input(input_csr)
+        output = srnn.output()
 
     # Prediction: class with most spikes
     pred = np.argmax(output)
@@ -116,27 +118,32 @@ def run_single_image_broadcast(image, label, srnn: SimpleBroadcastSrnn, duration
     return loss, pred
 
 # --- New train/test loops for broadcasting SRNN ---
-def train_broadcast(srnn: SimpleBroadcastSrnn, images, labels, epochs=1, duration=10):
+def train_broadcast(srnn: LocalBroadcastSrnn | SimpleBroadcastSrnn, images, labels, epochs=1, duration=10):
     for epoch in range(epochs):
         correct = 0
         total_loss = 0
+        b = 0
         for i, (img, lbl) in enumerate(tqdm(zip(images, labels), total=len(images), desc=f"Epoch {epoch+1}")):
             loss, pred = run_single_image_broadcast(img, lbl, srnn, duration)
             if pred == lbl:
                 correct += 1
             if loss is not None:
                 total_loss += loss
-            srnn.update_parameters()
-            srnn.update_outweights()
+            
+            b += 1
+            if b == batch_size:
+                srnn.update_parameters()
+                srnn.update_outweights()
+                b = 0
+
         acc = correct / len(images)
         avg_loss = total_loss / len(images)
         print(f"Epoch {epoch+1} - Accuracy: {acc:.3f}, Average Loss: {avg_loss:.3f}")
 
-def test_broadcast(srnn: SimpleBroadcastSrnn, images, labels, duration):
+def test_broadcast(srnn: LocalBroadcastSrnn | SimpleBroadcastSrnn, images, labels, duration):
     correct = 0
     for img, lbl in tqdm(zip(images, labels), total=len(images), desc="Testing"):
-        _, output = run_single_image_broadcast(img, None, srnn, duration)
-        pred = np.argmax(output)
+        _, pred = run_single_image_broadcast(img, None, srnn, duration)
         if pred == lbl:
             correct += 1
     acc = correct / len(images)
@@ -147,7 +154,7 @@ def test_broadcast(srnn: SimpleBroadcastSrnn, images, labels, duration):
 if __name__ == "__main__":
     # Load data
     print("Loading MNIST dataset...")
-    duration = 1000
+    duration = 100
     batch_size = 1
     n_hidden = 64
     images, labels = load_mnist(n_samples=100)
