@@ -2,7 +2,7 @@ import numpy as np
 import scipy.sparse as sp
 import multiprocessing as mp
 import time
-from srnn import ALIFLayer, SoftmaxOutputLayer 
+from srnn import ALIFLayer, OutputLayer 
 
 
 class SimpleBroadcastSrnn:
@@ -14,7 +14,8 @@ class SimpleBroadcastSrnn:
         hidden_connectivity=0.01,
         local_connectivity=0.1,
         output_connectivity=0.03,
-        layer_configs: list | None = None
+        layer_configs: list | None = None,
+        output_activation_function: str = "softmax"
     ):
         if layer_configs is None:
             layer_configs = [{} for _ in num_neurons_list]
@@ -53,7 +54,6 @@ class SimpleBroadcastSrnn:
             local_connection_density=local_connectivity,
             batch_size=1,
             output_size=output_size,
-            # fixed_dt=1e-3,
             beta="sparse_adaptive",
             beta_params={
                 "lif_fraction": 0.6,  # Fraction of LIF neurons
@@ -78,11 +78,12 @@ class SimpleBroadcastSrnn:
             self.processes.append(p)
 
         num_hidden = sum(num_neurons_list)
-        self.output_layer = SoftmaxOutputLayer(
+        self.output_layer = OutputLayer(
             num_hidden=input_size + num_hidden,
             num_outputs=output_size,
             learning_rate=0.01,
             connection_density=output_connectivity,
+            activation_function=output_activation_function
             # fixed_dt=1e-3,
             # input_offset=self.layers_offsets[-1]
         )
@@ -108,7 +109,9 @@ class SimpleBroadcastSrnn:
                 case "PULSE":
                     # print("PULSE")
                     layer.receive_pulse(data)  # expects csr_matrix
+                case "NEXT_TIME_STEP":
                     # Get local spikes
+                    layer.next_time_step()
                     local_spikes = layer.get_output_spikes()
                     output_spikes = sp.hstack([
                         sp.csr_matrix((1, layer_offset)),
@@ -138,6 +141,8 @@ class SimpleBroadcastSrnn:
         input_data = input_data.maximum(self.previous_output_spikes)
         for q in self.input_queues:
             q.put(("PULSE", input_data))
+            q.put(("NEXT_TIME_STEP", input_data))
+
         # Wait for any layer to finish
         # ready = [q for q in self.output_queues if not q.empty()]
         self.previous_output_spikes = sp.csr_matrix((1, self.global_size))
@@ -150,16 +155,17 @@ class SimpleBroadcastSrnn:
             # for q in self.input_queues:
             #     # print("Sending Pulse")
             #     q.put(("PULSE", output_spikes))
-        
-        self.output_layer.receive_pulse(self.previous_output_spikes)
-        # self.output_layer.receive_pulse(input_data)
+            self.output_layer.receive_pulse(output_spikes)
+
+        self.output_layer.next_time_step()
         # input("input")
+
     def output(self):
         return self.output_layer.output()
     
-    def feedback(self, label):
-        errors = self.output_layer.compute_error(label)
-        loss = self.output_layer.compute_loss(label)
+    def feedback(self, value: int | float):
+        errors = self.output_layer.compute_error(value)
+        loss = self.output_layer.compute_loss(value)
         for q in self.input_queues:
             q.put(("FEEDBACK", errors))
         self.output_layer.accumulate_gradient(errors)

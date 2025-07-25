@@ -6,6 +6,8 @@ import torchvision
 import torchvision.transforms as transforms
 from tqdm import tqdm
 import json
+import time
+import random
 
 
 def poisson_encode(image: np.ndarray, duration=100, max_prob=0.25):
@@ -98,9 +100,13 @@ def load_mnist(n_samples=1000):
 # --- New run_single_image for broadcasting SRNN ---
 def run_single_image_broadcast(image, label, srnn: LocalBroadcastSrnn | SimpleBroadcastSrnn, duration):
     srnn.reset()
-    # spikes = poisson_encode(image, duration=duration, max_prob=0.1)
+    spikes = poisson_encode(image, duration=duration, max_prob=0.01)
     # spikes = freq_encode(image, duration=duration)
-    spikes = bucket_encode(image, duration=duration)
+    # spikes = bucket_encode(image, duration=duration)
+
+    # noise = (np.random.rand(spikes.shape[0], spikes.shape[1]) < 0.01)
+    # spikes = spikes | noise
+
     input_size = srnn.input_size
     total_size = srnn.input_size + srnn.total_neurons
     for t in range(duration):
@@ -157,7 +163,7 @@ if __name__ == "__main__":
     duration = 100
     batch_size = 1
     n_hidden = 64
-    images, labels = load_mnist(n_samples=100)
+    images, labels = load_mnist(n_samples=15)
     train_images, train_labels = images[:int(len(images)*0.8)], labels[:int(len(images)*0.8)]
     test_images, test_labels = images[int(len(images)*0.8):], labels[int(len(images)*0.8):]
     print(f"Loaded {len(train_images)} training samples")
@@ -165,7 +171,7 @@ if __name__ == "__main__":
 
     # Build broadcasting SRNN
     print("Building broadcasting SRNN network...")
-    num_layers = 4
+    num_layers = 8
     num_neurons_list = [n_hidden for _ in range(num_layers)]
     input_size = 784
     output_size = 10
@@ -173,7 +179,8 @@ if __name__ == "__main__":
     hidden_connectivity = 0.025
     output_connectivity = 0.3
     local_connectivity = 0.13
-    srnn = SimpleBroadcastSrnn(
+    # srnn = SimpleBroadcastSrnn(
+    srnn = LocalBroadcastSrnn(
         num_neurons_list=num_neurons_list, 
         input_size=input_size, 
         output_size=output_size,
@@ -213,7 +220,7 @@ if __name__ == "__main__":
         print(f"Layer {i+1}: n={n}, local_connectivity={p_local}, Probability of connected local subgraph: {prob_connected_local:.4f}")
         if prob_connected_local < 0.01:
             print(f"  Warning: Layer {i+1} is almost certainly disconnected internally at this local connectivity.")
-    print(f"Actual number of connections {json.dumps(srnn.get_n_connections(), indent=2)}")
+    # print(f"Actual number of connections {json.dumps(srnn.get_n_connections(), indent=2)}")
     
     # Train network (no learning yet, just demo)
     print("Training network...")

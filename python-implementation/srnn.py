@@ -210,7 +210,7 @@ class ALIFLayer:
         local_connection_density: float = 0.1,
         tau=2000e-3,
         tau_out=20e-2,
-        fixed_dt=None,
+        dt=1e-3,
         output_size: int = 1,
         # ALIF-specific parameters
         tau_adaptation=200e-3,  # Adaptation time constant
@@ -223,7 +223,7 @@ class ALIFLayer:
     ):
         assert just_input_size + num_neurons <= num_inputs
 
-        self.fixed_dt = fixed_dt
+        self.dt = dt
 
         self.just_input_size = just_input_size
         self.num_inputs = num_inputs
@@ -234,6 +234,10 @@ class ALIFLayer:
         self.tau_out = tau_out
         self.tau_adaptation = tau_adaptation
         
+        self.alpha = np.exp(-dt / self.tau)
+        self.kappa = np.exp(-dt / self.tau_out)
+        self.rho = np.exp(-dt / self.tau_adaptation)
+
         self.firing_threshold = firing_threshold
         self.learning_rate = learning_rate
         self.pseudo_derivative_slope = pseudo_derivative_slope
@@ -300,19 +304,10 @@ class ALIFLayer:
 
     def receive_pulse(self, spike_vector):
         """Receive input spikes"""
-        dt = time.time() - self.last_time if self.fixed_dt is None else self.fixed_dt
-
-        self.last_time = time.time()
-
-        alpha = np.exp(-dt / self.tau)
-        kappa = np.exp(-dt / self.tau_out)
-        
-        # ALIF-specific parameters
-        rho = np.exp(-dt / self.tau_adaptation)
         self.input_spikes = self.input_spikes.maximum(spike_vector)
 
-    # def next_time_step(self):
-    #     """Update all neurons for one time step - ALIF dynamics"""
+    def next_time_step(self):
+        """Update all neurons for one time step - ALIF dynamics"""
         # Compute effective threshold (base + adaptive component)
         # A_j^t = v_th + βa_t^j
 
@@ -323,7 +318,7 @@ class ALIFLayer:
         
         # Update membrane potentials
         self.membrane_potentials = np.asarray(
-            self.membrane_potentials * alpha
+            self.membrane_potentials * self.alpha
             + (self.weights * self.input_spikes.T).T
             - self.effective_thresholds * self.sending_pulses
         ).reshape(-1)
@@ -338,25 +333,25 @@ class ALIFLayer:
         
         # Update adaptive thresholds: decay + spike-triggered increase
         self.adaptive_thresholds = (
-            self.adaptive_thresholds * rho + self.sending_pulses
+            self.adaptive_thresholds * self.rho + self.sending_pulses
         )
 
         # Update eligibility vectors
         pseudo_derivatives = self.h_pseudo_derivative()[:, np.newaxis]
         self.low_pass_active_connections = (
-            self.low_pass_active_connections * alpha
+            self.low_pass_active_connections * self.alpha
             + (self.weights != 0).multiply(self.input_spikes)
         )
 
         self.adaptative_eligibility_vector = (
             self.adaptative_eligibility_vector
-            .multiply(( rho - (self.betas * pseudo_derivatives.reshape(-1)).T ))
+            .multiply(( self.rho - (self.betas * pseudo_derivatives.reshape(-1)).T ))
             + self.low_pass_active_connections.multiply(pseudo_derivatives)
         )
 
         # Update low-pass eligibility traces
         self.low_pass_eligibility_traces = (
-            self.low_pass_eligibility_traces * kappa 
+            self.low_pass_eligibility_traces * self.kappa 
             + (
               self.low_pass_active_connections 
               - self.adaptative_eligibility_vector.multiply(self.betas.reshape(-1, 1))
@@ -370,8 +365,8 @@ class ALIFLayer:
         # Update refractory periods
         self.refractory_periods = np.where(
             self.sending_pulses, 
-            dt*6,  # Set refractory period to 3 for firing neurons
-            np.maximum(0, self.refractory_periods - dt)  # Decrement for others
+            self.dt*3,
+            np.maximum(0, self.refractory_periods - self.dt)  # Decrement for others
         )
 
 
@@ -425,8 +420,11 @@ class ALIFLayer:
         # Only update weights that exist (multiply by weight mask)
         masked_update = update_sparse.multiply(self.weights != 0)
         
-        # Update weights
-        self.weights = self.weights - masked_update
+        l2_lambda = 1e-3
+        l2_penalty = l2_lambda * self.weights
+
+        # Apply L2 penalty during weight updates
+        self.weights = self.weights - masked_update - l2_penalty
         
         # Reset accumulated updates
         self.accumulated_weight_updates = sp.csr_matrix((self.num_neurons, self.num_inputs))
@@ -490,7 +488,7 @@ class ALIFLayer:
         print(f"  Max β: {np.max(self.betas):.4f}")
         print(f"  Min β: {np.min(self.betas):.4f}")
 
-class SoftmaxOutputLayer:
+class OutputLayer:
     def reset(self):
         self.input_spikes = sp.csr_matrix((1, self.num_hidden))
         self.membrane_potentials = np.zeros(self.num_outputs)
@@ -505,16 +503,21 @@ class SoftmaxOutputLayer:
         learning_rate: float = 0.01,
         connection_density: float = 0.05,  # Fraction of connections present
         tau_out=20e-2,
-        fixed_dt=None
+        dt=1e-3,
+        activation_function: str = 'softmax',  # 'linear', 'softmax'
+        unary_weights: bool = False
     ):
-        self.fixed_dt = fixed_dt
+        self.unary_weights = unary_weights
+        self.activation_function = activation_function
+        assert self.activation_function in ["softmax", "linear"]
 
         self.num_hidden = num_hidden
         self.num_outputs = num_outputs
         self.learning_rate = learning_rate
 
         self.tau_out = tau_out
-
+        self.kappa = np.exp(-dt / self.tau_out)
+        print(self.kappa)
         # Sparse initialization with input_offset: zero out columns < input_offset
         weight_mask = sp.random(num_outputs, num_hidden, density=connection_density, format='csr')
         if input_offset > 0:
@@ -523,7 +526,11 @@ class SoftmaxOutputLayer:
             mask[:, :input_offset] = 0
             weight_mask = sp.csr_matrix(mask)
 
-        weight_values = np.random.normal(0, 0.1, size=weight_mask.nnz)
+        if self.unary_weights:
+            weight_values = np.ones(weight_mask.nnz)/weight_mask.nnz
+        else:
+            weight_values = np.random.normal(0, 10.0/weight_mask.nnz, size=weight_mask.nnz)
+
         self.weights = sp.csr_matrix((weight_values, weight_mask.indices, weight_mask.indptr),
                                      shape=(num_outputs, num_hidden))
 
@@ -540,12 +547,7 @@ class SoftmaxOutputLayer:
         assert sparse_spike_vector.shape == (1, self.num_hidden)
         self.input_spikes = self.input_spikes.maximum(sparse_spike_vector)
 
-        dt = time.time() - self.last_time if self.fixed_dt is None else self.fixed_dt
-
-        self.last_time = time.time()
-
-        kappa = np.exp(-dt / self.tau_out)
-
+    def next_time_step(self):
         # Convert to dense for single timestep usage
         self.last_spikes = np.zeros(self.num_hidden)
         if self.input_spikes.nnz > 0:
@@ -553,7 +555,7 @@ class SoftmaxOutputLayer:
 
         # Sparse matrix-vector multiplication
         self.membrane_potentials = (
-            kappa * self.membrane_potentials
+            self.kappa * self.membrane_potentials
             + self.weights @ self.last_spikes
             + self.bias
         )
@@ -562,22 +564,33 @@ class SoftmaxOutputLayer:
         self.input_spikes = sp.csr_matrix((1, self.num_hidden))
 
     def output(self):
-        exps = np.exp(self.membrane_potentials - np.max(self.membrane_potentials))
-        return exps / np.sum(exps)
+        if self.activation_function == "softmax":
+            exps = np.exp(self.membrane_potentials - np.max(self.membrane_potentials))
+            return exps / np.sum(exps)
+        else:
+            return self.membrane_potentials
 
-    def compute_loss(self, target_class: int):
-        probs = self.output()
-        return -np.log(probs[target_class] + 1e-9)
+    def compute_loss(self, target: int | np.ndarray):
+        output = self.output()
+        if self.activation_function == "softmax":
+            return -np.log(output[target] + 1e-9)
+        else:
+            return 0.5 * np.sum((output - target) ** 2)
 
-    def compute_error(self, target_class: int):
-        probs = self.output()
-        probs[target_class] -= 1
-        return probs
+    def compute_error(self, target: int | np.ndarray):
+        output = self.output()
+        if self.activation_function == "softmax":
+            output[target] -= 1
+            return output
+        else:
+            return output - target
 
     def accumulate_gradient(self, error_signal: np.ndarray):
         """
         Only accumulate gradients for non-zero weights and active spikes.
         """
+        if self.unary_weights:
+            return
         # Outer product: error_signal (num_outputs) x last_spikes (num_hidden)
         grad_dense = np.outer(error_signal, self.last_spikes)
 
@@ -590,7 +603,7 @@ class SoftmaxOutputLayer:
         self.batch_size += 1
 
     def update_parameters(self):
-        if self.batch_size == 0:
+        if self.unary_weights or self.batch_size == 0:
             return
 
         lr_scaled = self.learning_rate / self.batch_size
@@ -604,4 +617,3 @@ class SoftmaxOutputLayer:
         self.accumulated_gradients = sp.csr_matrix(self.weights.shape)
         self.accumulated_bias_gradients[:] = 0
         self.batch_size = 0
-

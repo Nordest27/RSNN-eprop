@@ -1,6 +1,9 @@
+import enum
+from typing import List
 import numpy as np
 import scipy.sparse as sp
-from srnn import ALIFLayer, SoftmaxOutputLayer 
+from sympy.simplify.fu import L
+from srnn import ALIFLayer, OutputLayer 
 from visualize import SRNNVisualizer
 import torchvision
 import torchvision.transforms as transforms
@@ -81,6 +84,32 @@ def bucket_cycle_encode(image: np.ndarray, duration=100, discretization=5):
 
     return spike_train
 
+def bucket_multiple_encode(images: list[np.ndarray], duration=100, discretization=5):
+    spike_train = np.zeros((duration, 784), dtype=np.uint8)
+
+    for i, image in enumerate(images):
+        flat_image = image.flatten()
+        # Assign each pixel to a bucket (0 = brightest, discretization-1 = dimmest)
+        bucket_indices = (discretization - 1 - (flat_image * (discretization - 1)).astype(int)).clip(0, discretization - 1)
+                
+        for t in range(duration):
+            if t % discretization == discretization-1:
+                continue
+            spike_train[t, bucket_indices == (t - discretization * i)] = 1
+
+    return spike_train
+
+def get_input(image, duration):
+    spikes = poisson_encode(image, duration=duration, max_prob=0.1)
+    # spikes = freq_encode(image, duration=duration)
+    # spikes = bucket_encode(image, duration)
+    # spikes = bucket_cycle_encode(image, duration)
+    # spikes = bucket_multiple_encode(image, duration=duration)
+    # noise = (np.random.rand(spikes.shape[0], spikes.shape[1]) < 0.01)
+    # spikes = spikes | noise
+    # spikes = np.ones(spikes.shape) - spikes
+    return spikes
+
 
 # Define dataset loader
 def load_mnist(n_samples=1000):
@@ -114,8 +143,7 @@ def build_hidden_layer(
         local_connection_density=local_connection_density,
         output_size=10,
         batch_size=batch_size,
-        firing_threshold=0.6,
-        # fixed_dt=1e-3,
+        firing_threshold=1.0,
         beta="sparse_adaptive",
         beta_params={
             "lif_fraction": 0.6,  # Fraction of LIF neurons
@@ -127,27 +155,26 @@ def build_hidden_layer(
     return hidden_layer
 
 def build_output_layer(num_outputs=10, num_hidden=100, connection_density=0.05):
-    return SoftmaxOutputLayer(
+    return OutputLayer(
         num_hidden=num_hidden,
         num_outputs=num_outputs,
         learning_rate=1e-2,
         connection_density=connection_density,
-        # fixed_dt=1e-3,
     )
 
 def run_single_image(image, label, hidden_layer, output_layer, duration):
     """
     Run a single image through the network.
     """
-    # spikes = poisson_encode(image, duration=duration, max_prob=0.1)
-    # spikes = freq_encode(image, duration=duration)
-    spikes = bucket_encode(image, duration)
-    # spikes = bucket_cycle_encode(image, duration)
+    spikes = get_input(image, duration)
+    label = [label] if not isinstance(label, list) else label
     
     spikes_shape = spikes.shape
     spikes = sp.csr_matrix(spikes, shape=spikes_shape)
     # Initialize output spike counts
     hidden_output = hidden_layer.get_output_spikes()
+    loss = None
+    outputs = []
     for t in range(duration):
         input_spike_vector = sp.hstack([
             spikes.getrow(t), 
@@ -155,20 +182,21 @@ def run_single_image(image, label, hidden_layer, output_layer, duration):
         ])
         # Feed input to hidden layer
         hidden_layer.receive_pulse(input_spike_vector)
-        # hidden_layer.next_time_step()
+        hidden_layer.next_time_step()
         
         # Get hidden layer output and feed to output layer
         hidden_output = hidden_layer.get_output_spikes()
         # if hidden_output.nnz > 0:  # Only if there are spikes
         output_layer.receive_pulse(hidden_output)
-        
-        # output_layer.update()
-    
-    loss = None
-    if label is not None:
+        output_layer.next_time_step()
+
+    if label[0] is not None:
+        aux_label = label
+        if isinstance(label, list):
+            aux_label = label[0]
         # Compute error and backpropagate
-        error_signal = output_layer.compute_error(label)
-        loss = output_layer.compute_loss(label)
+        error_signal = output_layer.compute_error(aux_label)
+        loss = output_layer.compute_loss(aux_label) + (loss if loss is not None else 0)
         
         # Backpropagate to hidden layer
         hidden_layer.receive_error(error_signal)
@@ -176,12 +204,13 @@ def run_single_image(image, label, hidden_layer, output_layer, duration):
         # Accumulate gradients for output layer
         output_layer.accumulate_gradient(error_signal)
 
-    output = output_layer.output()
+        outputs.append(output_layer.output())
+
     # Reset layers for next image
     hidden_layer.reset()
     output_layer.reset()
     
-    return loss, output
+    return loss, outputs
 
 def train(hidden_layer, output_layer, images, labels, epochs=1, batch_size=10, duration=10):
     """
@@ -191,14 +220,17 @@ def train(hidden_layer, output_layer, images, labels, epochs=1, batch_size=10, d
         correct = 0
         total_loss = 0
         
-        for i, (img, lbl) in enumerate(tqdm(zip(images, labels), total=len(images), desc=f"Epoch {epoch+1}")):
+        for i in tqdm(range(len(images)), total=len(images), desc=f"Epoch {epoch+1}"):
+            img = images[i]
+            lbl = [labels[i]]
             # Run single image
-            loss, output = run_single_image(img, lbl, hidden_layer, output_layer, duration)
+            loss, outputs = run_single_image(img, lbl, hidden_layer, output_layer, duration)
 
-            # Make prediction
-            pred = np.argmax(output)
-            if pred == lbl:
-                correct += 1
+            for i in range(len(outputs)):
+                # Make prediction
+                pred = np.argmax(outputs[i])
+                if pred == lbl[i]:
+                    correct += 1/len(outputs)
             
             # Compute loss for monitoring
             total_loss += loss
@@ -240,10 +272,9 @@ def test(hidden_layer, output_layer, images, labels, duration):
     return acc
 
 def visualize_mnist(image, label, hidden_layer, output_layer, duration):
-    # spikes = poisson_encode(image, duration=duration, max_prob=0.1)
-    # spikes = freq_encode(image, duration=duration)
-    spikes = bucket_encode(image, duration)
-    # spikes = bucket_cycle_encode(image, duration)
+    print(label)
+    spikes = get_input(image, duration)
+
     visualizer = SRNNVisualizer(hidden_layer, spikes, output_layer)
     visualizer.animate(interval=10)
 
@@ -251,25 +282,26 @@ def visualize_mnist(image, label, hidden_layer, output_layer, duration):
 if __name__ == "__main__":
     # Load data
     print("Loading MNIST dataset...")
-    duration = 100
+    duration = 15
     batch_size = 1
     n_hidden = 64
-    images, labels = load_mnist(n_samples=100)
+    images, labels = load_mnist(n_samples=1000)
     train_images, train_labels = images[:int(len(images)*0.8)], labels[:int(len(images)*0.8)]
     test_images, test_labels = images[int(len(images)*0.8):], labels[int(len(images)*0.8):]
     print(f"Loaded {len(train_images)} training samples")
     print(f"Label distribution: {np.bincount(train_labels)}")
-    
+
     # Build network
     print("Building network...")
     hidden_layer = build_hidden_layer(
         num_hidden=n_hidden, 
         input_connection_density=0.3,
-        local_connection_density=0.5, 
+        local_connection_density=0.13, 
         batch_size=batch_size
     )
+    print(hidden_layer.weights.nnz)
     output_layer = build_output_layer(num_hidden=n_hidden, connection_density=0.3)
-    
+    print(output_layer.weights.nnz)
     # Train network
     print("Training network...")
     train(hidden_layer, output_layer, train_images, train_labels, 
@@ -281,10 +313,10 @@ if __name__ == "__main__":
 
     print("Visualizing")
     while input("Visualize?"):
-        i = np.random.randint(len(test_images))
+        i = np.random.randint(len(train_images)-2)
         visualize_mnist(
-            test_images[i],
-            test_images[i],
+            train_images[i:i+2],
+            train_labels[i:i+2],
             hidden_layer, 
             output_layer, 
             1000
