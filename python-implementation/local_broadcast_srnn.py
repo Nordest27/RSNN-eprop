@@ -17,8 +17,9 @@ class LocalBroadcastSrnn:
         output_connectivity=0.03,
         layer_configs: list | None = None,
         output_activation_function: str = "softmax",
-        tau_out: float = 0.2,
-        unary_weights: bool = False
+        tau_out: float = 20e-3,
+        unary_weights: bool = False,
+        self_predict: bool = False
     ):
         if layer_configs is None:
             layer_configs = [{} for _ in num_neurons_list]
@@ -55,6 +56,7 @@ class LocalBroadcastSrnn:
             hidden_connection_density=hidden_connectivity,
             local_connection_density=local_connectivity,
             batch_size=1,
+            self_predict=self_predict,
             output_size=output_size,
             tau_out=tau_out,
             beta="sparse_adaptive",
@@ -86,7 +88,7 @@ class LocalBroadcastSrnn:
         self.output_layer = OutputLayer(
             num_hidden=input_size + num_hidden,
             num_outputs=output_size,
-            learning_rate=0.001,
+            learning_rate=0.01,
             connection_density=output_connectivity,
             activation_function=output_activation_function,
             # input_offset=self.layers_offsets[-1]

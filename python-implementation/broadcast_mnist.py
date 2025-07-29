@@ -100,9 +100,9 @@ def load_mnist(n_samples=1000):
 # --- New run_single_image for broadcasting SRNN ---
 def run_single_image_broadcast(image, label, srnn: LocalBroadcastSrnn | SimpleBroadcastSrnn, duration):
     srnn.reset()
-    spikes = poisson_encode(image, duration=duration, max_prob=0.01)
+    # spikes = poisson_encode(image, duration=duration, max_prob=0.01)
     # spikes = freq_encode(image, duration=duration)
-    # spikes = bucket_encode(image, duration=duration)
+    spikes = bucket_encode(image, duration=duration)
 
     # noise = (np.random.rand(spikes.shape[0], spikes.shape[1]) < 0.01)
     # spikes = spikes | noise
@@ -187,7 +187,8 @@ if __name__ == "__main__":
         input_connectivity=input_connectivity,
         hidden_connectivity=hidden_connectivity,
         output_connectivity=output_connectivity,
-        local_connectivity=local_connectivity
+        local_connectivity=local_connectivity,
+        self_predict=True
     )
 
     print(f"Number of neurons: {sum(num_neurons_list)}")

@@ -144,6 +144,7 @@ def build_hidden_layer(
         output_size=10,
         batch_size=batch_size,
         firing_threshold=1.0,
+        self_predict=True,
         beta="sparse_adaptive",
         beta_params={
             "lif_fraction": 0.6,  # Fraction of LIF neurons
@@ -255,21 +256,21 @@ def train(hidden_layer, output_layer, images, labels, epochs=1, batch_size=10, d
         avg_loss = total_loss / len(images)
         print(f"Epoch {epoch+1} - Accuracy: {acc:.3f}, Average Loss: {avg_loss:.3f}")
 
-def test(hidden_layer, output_layer, images, labels, duration):
-    """
-    Test the trained network.
-    """
-    correct = 0
+# def test(hidden_layer, output_layer, images, labels, duration):
+#     """
+#     Test the trained network.
+#     """
+#     correct = 0
 
-    for img, lbl in tqdm(zip(images, labels), total=len(images), desc="Testing"):
-        _, output = run_single_image(img, None, hidden_layer, output_layer, duration)
-        pred = np.argmax(output)
-        if pred == lbl:
-            correct += 1
+#     for img, lbl in tqdm(zip(images, labels), total=len(images), desc="Testing"):
+#         _, output = run_single_image(img, None, hidden_layer, output_layer, duration)
+#         pred = np.argmax(output[0])
+#         if pred == lbl:
+#             correct += 1
     
-    acc = correct / len(images)
-    print(f"Test Accuracy: {acc:.3f}")
-    return acc
+#     acc = correct / len(images)
+#     print(f"Test Accuracy: {acc:.3f}")
+#     return acc
 
 def visualize_mnist(image, label, hidden_layer, output_layer, duration):
     print(label)
@@ -282,10 +283,10 @@ def visualize_mnist(image, label, hidden_layer, output_layer, duration):
 if __name__ == "__main__":
     # Load data
     print("Loading MNIST dataset...")
-    duration = 15
+    duration = 10
     batch_size = 1
     n_hidden = 64
-    images, labels = load_mnist(n_samples=1000)
+    images, labels = load_mnist(n_samples=100)
     train_images, train_labels = images[:int(len(images)*0.8)], labels[:int(len(images)*0.8)]
     test_images, test_labels = images[int(len(images)*0.8):], labels[int(len(images)*0.8):]
     print(f"Loaded {len(train_images)} training samples")
@@ -296,7 +297,7 @@ if __name__ == "__main__":
     hidden_layer = build_hidden_layer(
         num_hidden=n_hidden, 
         input_connection_density=0.3,
-        local_connection_density=0.13, 
+        local_connection_density=0.13,
         batch_size=batch_size
     )
     print(hidden_layer.weights.nnz)
@@ -307,16 +308,16 @@ if __name__ == "__main__":
     train(hidden_layer, output_layer, train_images, train_labels, 
           epochs=25, batch_size=batch_size, duration=duration)
     
-    # Test on training data (you should use separate test data in practice)
-    print("Testing network...")
-    test(hidden_layer, output_layer, test_images, test_labels, duration)
+    # # Test on training data (you should use separate test data in practice)
+    # print("Testing network...")
+    # test(hidden_layer, output_layer, test_images, test_labels, duration)
 
     print("Visualizing")
     while input("Visualize?"):
         i = np.random.randint(len(train_images)-2)
         visualize_mnist(
-            train_images[i:i+2],
-            train_labels[i:i+2],
+            train_images[i],
+            train_labels[i],
             hidden_layer, 
             output_layer, 
             1000

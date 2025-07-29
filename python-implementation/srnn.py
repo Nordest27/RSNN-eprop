@@ -167,8 +167,12 @@ class ALIFLayer:
         self.adaptative_eligibility_vector = sp.csr_matrix((self.num_neurons, self.num_inputs))
         self.low_pass_eligibility_traces = sp.csr_matrix((self.num_neurons, self.num_inputs))
         self.learning_signals = np.zeros(self.num_neurons)
+
+        if self.self_predict_layer is not None:
+            self.self_predict_layer.reset()
         
         self.last_time = time.time()
+        self.time_step = 0
 
     def calculate_weight_mask(self):
         """Same as LIF layer - creates sparse connectivity pattern"""
@@ -212,6 +216,7 @@ class ALIFLayer:
         tau_out=20e-2,
         dt=1e-3,
         output_size: int = 1,
+        self_predict: bool = False,
         # ALIF-specific parameters
         tau_adaptation=200e-3,  # Adaptation time constant
         beta: float | str = 0.07,  # Adaptation coupling strength
@@ -257,7 +262,8 @@ class ALIFLayer:
 
         # Initialize weights
         weight_mask = self.calculate_weight_mask()
-        weight_values = np.random.normal(0, 0.1, size=weight_mask.nnz)
+        weight_values = np.random.randn(weight_mask.nnz) / np.sqrt(num_inputs)
+        #weight_values = get_init_fluct_weights(num_neurons, firing_threshold, tau, weight_mask.nnz)
         self.weights = sp.csr_matrix((weight_values, weight_mask.indices, weight_mask.indptr),
                                    shape=(num_neurons, self.num_inputs))
 
@@ -271,7 +277,20 @@ class ALIFLayer:
         self.adam_step = 0
         self.m_weights = sp.csr_matrix((num_neurons, self.num_inputs))
         self.v_weights = sp.csr_matrix((num_neurons, self.num_inputs))
-        
+
+        self.self_predict_layer = None
+        if self_predict:
+            self.self_predict_layer = OutputLayer(
+                num_hidden=num_inputs, 
+                num_outputs=num_neurons//1,
+                input_offset=just_input_size,
+                dt=dt,
+                tau_out=tau_out,
+                connection_density=local_connection_density,
+                activation_function="sigmoid"
+            )
+            self.self_predict_loss_weights = abs(sp.random(num_neurons, num_neurons//1, density=1.0, format='csr'))
+
         self.reset()
 
     def heavy_side_step_function(self, x: np.ndarray) -> np.ndarray:
@@ -358,6 +377,23 @@ class ALIFLayer:
             )
             .multiply(pseudo_derivatives) 
         )
+        
+        if self.self_predict_layer is not None:
+            self.self_predict_layer.receive_pulse(
+                self.input_spikes
+                # [:, self.recurrent_start:self.recurrent_start + self.num_neurons]
+            )
+            if self.time_step % 1 == 0:
+                error = (
+                    self.self_predict_layer.compute_error(
+                        self.sending_pulses[:self.num_neurons//1]
+                    ) / self.num_neurons
+                )
+                predict_output = self.self_predict_layer.output()
+                entropy_grad = -np.log(predict_output + 1e-9) - 1
+                lambda_entropy = 0.1  # Tune this value as needed
+                error += lambda_entropy * entropy_grad
+                self.self_predict_layer.accumulate_gradient(error)
 
         # Reset accumulated inputs
         self.input_spikes = sp.csr_matrix((1, self.num_inputs))
@@ -365,15 +401,19 @@ class ALIFLayer:
         # Update refractory periods
         self.refractory_periods = np.where(
             self.sending_pulses, 
-            self.dt*3,
-            np.maximum(0, self.refractory_periods - self.dt)  # Decrement for others
+            3,
+            np.maximum(0, self.refractory_periods - 1)  # Decrement for others
         )
 
+        self.time_step += 1
 
-    def receive_error(self, errors):
+    def receive_error(self, errors, self_predict=False):
         """Receive error signals and compute learning signals"""
         # Compute learning signal for each neuron
-        self.learning_signals = self.loss_weights @ errors
+        if not self_predict:
+            self.learning_signals = self.loss_weights @ errors
+        else:
+            self.learning_signals = self.self_predict_loss_weights @ errors
 
         # Compute updates only for existing weights
         rows, cols = self.weights.nonzero()
@@ -391,6 +431,12 @@ class ALIFLayer:
         """Apply accumulated weight updates using Adam optimizer"""
         if self.accumulated_weight_updates.nnz == 0:
             return
+        if self.self_predict_layer is not None:
+            self.self_predict_layer.update_parameters()
+            start = self.recurrent_start
+            end = start + self.num_neurons
+            out_w = self.self_predict_layer.weights[:, start:end].T
+            self.self_predict_loss_weights[out_w.indices] = out_w[out_w.indices]
             
         # Scale gradients by batch size
         gradients = self.accumulated_weight_updates / self.batch_size
@@ -488,6 +534,7 @@ class ALIFLayer:
         print(f"  Max β: {np.max(self.betas):.4f}")
         print(f"  Min β: {np.min(self.betas):.4f}")
 
+
 class OutputLayer:
     def reset(self):
         self.input_spikes = sp.csr_matrix((1, self.num_hidden))
@@ -509,7 +556,7 @@ class OutputLayer:
     ):
         self.unary_weights = unary_weights
         self.activation_function = activation_function
-        assert self.activation_function in ["softmax", "linear"]
+        assert self.activation_function in ["softmax", "linear", "sigmoid"]
 
         self.num_hidden = num_hidden
         self.num_outputs = num_outputs
@@ -529,7 +576,7 @@ class OutputLayer:
         if self.unary_weights:
             weight_values = np.ones(weight_mask.nnz)/weight_mask.nnz
         else:
-            weight_values = np.random.normal(0, 10.0/weight_mask.nnz, size=weight_mask.nnz)
+            weight_values = np.random.randn(weight_mask.nnz) / np.sqrt(num_hidden)
 
         self.weights = sp.csr_matrix((weight_values, weight_mask.indices, weight_mask.indptr),
                                      shape=(num_outputs, num_hidden))
@@ -567,6 +614,8 @@ class OutputLayer:
         if self.activation_function == "softmax":
             exps = np.exp(self.membrane_potentials - np.max(self.membrane_potentials))
             return exps / np.sum(exps)
+        elif self.activation_function == "sigmoid":
+            return 1 / (1 + np.exp(-self.membrane_potentials))
         else:
             return self.membrane_potentials
 
