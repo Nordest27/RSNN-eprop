@@ -17,7 +17,7 @@ class LocalBroadcastSrnn:
         output_connectivity=0.03,
         layer_configs: list | None = None,
         output_activation_function: str = "softmax",
-        tau_out: float = 20e-3,
+        tau_out: float = 30e-3,
         unary_weights: bool = False,
         self_predict: bool = False
     ):
@@ -51,7 +51,7 @@ class LocalBroadcastSrnn:
             just_input_size=input_size,
             num_inputs=self.global_size,
             firing_threshold=1.0,
-            learning_rate=0.001,
+            learning_rate=0.0001,
             input_connection_density=input_connectivity,
             hidden_connection_density=hidden_connectivity,
             local_connection_density=local_connectivity,
@@ -61,7 +61,7 @@ class LocalBroadcastSrnn:
             tau_out=tau_out,
             beta="sparse_adaptive",
             beta_params={
-                "lif_fraction": 0.6,  # Fraction of LIF neurons
+                "lif_fraction": 0.8,  # Fraction of LIF neurons
                 "exp_scale": 0.2,     # Scale parameter for exponential distribution
                 "max_beta": 2.0       # Maximum beta value
             }
@@ -88,7 +88,7 @@ class LocalBroadcastSrnn:
         self.output_layer = OutputLayer(
             num_hidden=input_size + num_hidden,
             num_outputs=output_size,
-            learning_rate=0.01,
+            learning_rate=0.001,
             connection_density=output_connectivity,
             activation_function=output_activation_function,
             # input_offset=self.layers_offsets[-1]

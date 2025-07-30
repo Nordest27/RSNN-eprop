@@ -142,9 +142,8 @@ def build_hidden_layer(
         input_connection_density=input_connection_density,
         local_connection_density=local_connection_density,
         output_size=10,
-        batch_size=batch_size,
         firing_threshold=1.0,
-        self_predict=True,
+        # self_predict=True,
         beta="sparse_adaptive",
         beta_params={
             "lif_fraction": 0.6,  # Fraction of LIF neurons
@@ -208,10 +207,11 @@ def run_single_image(image, label, hidden_layer, output_layer, duration):
         outputs.append(output_layer.output())
 
     # Reset layers for next image
+    avg_firing_rate = hidden_layer.firing_rate
     hidden_layer.reset()
     output_layer.reset()
     
-    return loss, outputs
+    return loss, outputs, avg_firing_rate
 
 def train(hidden_layer, output_layer, images, labels, epochs=1, batch_size=10, duration=10):
     """
@@ -220,12 +220,13 @@ def train(hidden_layer, output_layer, images, labels, epochs=1, batch_size=10, d
     for epoch in range(epochs):
         correct = 0
         total_loss = 0
+        total_firing_rate = 0
         
         for i in tqdm(range(len(images)), total=len(images), desc=f"Epoch {epoch+1}"):
             img = images[i]
             lbl = [labels[i]]
             # Run single image
-            loss, outputs = run_single_image(img, lbl, hidden_layer, output_layer, duration)
+            loss, outputs, avg_firing_rate = run_single_image(img, lbl, hidden_layer, output_layer, duration)
 
             for i in range(len(outputs)):
                 # Make prediction
@@ -235,6 +236,7 @@ def train(hidden_layer, output_layer, images, labels, epochs=1, batch_size=10, d
             
             # Compute loss for monitoring
             total_loss += loss
+            total_firing_rate += avg_firing_rate
             
             # Update parameters every batch_size samples
             if (i + 1) % batch_size == 0:
@@ -254,7 +256,8 @@ def train(hidden_layer, output_layer, images, labels, epochs=1, batch_size=10, d
         # Print epoch statistics
         acc = correct / len(images)
         avg_loss = total_loss / len(images)
-        print(f"Epoch {epoch+1} - Accuracy: {acc:.3f}, Average Loss: {avg_loss:.3f}")
+        avg_fr = total_firing_rate / len(images)
+        print(f"Epoch {epoch+1} - Accuracy: {acc:.3f}, Average Loss: {avg_loss:.3f}, Firing Rate: {1000*avg_fr/hidden_layer.num_neurons:.3f} Hz")
 
 # def test(hidden_layer, output_layer, images, labels, duration):
 #     """
@@ -283,10 +286,10 @@ def visualize_mnist(image, label, hidden_layer, output_layer, duration):
 if __name__ == "__main__":
     # Load data
     print("Loading MNIST dataset...")
-    duration = 10
+    duration = 100
     batch_size = 1
     n_hidden = 64
-    images, labels = load_mnist(n_samples=100)
+    images, labels = load_mnist(n_samples=25)
     train_images, train_labels = images[:int(len(images)*0.8)], labels[:int(len(images)*0.8)]
     test_images, test_labels = images[int(len(images)*0.8):], labels[int(len(images)*0.8):]
     print(f"Loaded {len(train_images)} training samples")

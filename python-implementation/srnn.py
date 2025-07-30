@@ -159,6 +159,8 @@ class ALIFLayer:
         self.refractory_periods = np.zeros(self.num_neurons, dtype=int)
         self.input_spikes = sp.csr_matrix((1, self.num_inputs))
         
+        self.firing_rate = 0
+
         # ALIF-specific: adaptive threshold components
         self.adaptive_thresholds = np.zeros(self.num_neurons)
         
@@ -166,13 +168,12 @@ class ALIFLayer:
         self.low_pass_active_connections = sp.csr_matrix((self.num_neurons, self.num_inputs))
         self.adaptative_eligibility_vector = sp.csr_matrix((self.num_neurons, self.num_inputs))
         self.low_pass_eligibility_traces = sp.csr_matrix((self.num_neurons, self.num_inputs))
-        self.learning_signals = np.zeros(self.num_neurons)
 
         if self.self_predict_layer is not None:
             self.self_predict_layer.reset()
         
         self.last_time = time.time()
-        self.time_step = 0
+        self.time_step = 1
 
     def calculate_weight_mask(self):
         """Same as LIF layer - creates sparse connectivity pattern"""
@@ -204,9 +205,9 @@ class ALIFLayer:
         just_input_size: int,
         num_inputs: int,
         num_neurons: int,
-        batch_size: int,
         recurrent_start: int | None = None,
-        firing_threshold: float = 0.6,
+        firing_threshold: float = 1.0,
+        target_firing_rate: float = 13,
         learning_rate: float = 0.01,
         pseudo_derivative_slope: float = 0.3,
         input_connection_density: float = 0.1,
@@ -244,11 +245,13 @@ class ALIFLayer:
         self.rho = np.exp(-dt / self.tau_adaptation)
 
         self.firing_threshold = firing_threshold
+        self.target_firing_rate = target_firing_rate/1000
+        self.reg_coeff = 0.1
         self.learning_rate = learning_rate
         self.pseudo_derivative_slope = pseudo_derivative_slope
 
         self.betas = self.initialize_beta_distribution(beta, num_neurons, beta_params)
-        self.betas = self.betas.reshape(1, -1)
+        self.betas = self.betas.reshape(1, -1)  
         #self.beta = beta
 
         self.input_connection_density = input_connection_density
@@ -271,7 +274,6 @@ class ALIFLayer:
         
         # Initialize accumulated weight updates as sparse matrix
         self.accumulated_weight_updates = sp.csr_matrix((num_neurons, self.num_inputs))
-        self.batch_size = batch_size
         
         # Initialize Adam optimizer state
         self.adam_step = 0
@@ -303,22 +305,20 @@ class ALIFLayer:
         
         derivatives = np.zeros(self.num_neurons)
         active_neurons = mask
-        
-        if np.any(active_neurons):
-            # ψ_j^t = (1/v_th) * γ_pd * max(0, 1 - |v_j - A_j^t|/v_th)
+        # ψ_j^t = (1/v_th) * γ_pd * max(0, 1 - |v_j - A_j^t|/v_th)
 
-            derivatives[active_neurons] = (
-                (1 / self.firing_threshold) 
-                * self.pseudo_derivative_slope  # γ_pd = 0.3 in paper
-                * np.maximum(
-                    0,
-                    1 - np.abs(
-                        (self.membrane_potentials[active_neurons] - self.effective_thresholds[active_neurons]) 
-                        / self.firing_threshold
-                    )
+        derivatives[active_neurons] = (
+            (1 / self.firing_threshold) 
+            * self.pseudo_derivative_slope  # γ_pd = 0.3 in paper
+            * np.maximum(
+                0,
+                1 - np.abs(
+                    (self.membrane_potentials[active_neurons] - self.effective_thresholds[active_neurons]) 
+                    / self.firing_threshold
                 )
             )
-        
+        )
+    
         return derivatives
 
     def receive_pulse(self, spike_vector):
@@ -343,13 +343,23 @@ class ALIFLayer:
         ).reshape(-1)
 
         # Determine which neurons are firing (using effective threshold)
-        self.sending_pulses = np.multiply(
+        self.sending_pulses = np.where(
+            self.refractory_periods == 0,
             self.heavy_side_step_function(
                 self.membrane_potentials - self.effective_thresholds
             ),
-            self.refractory_periods == 0
+            0
         )
-        
+        self.firing_rate = (
+            self.firing_rate*(self.time_step-1)/self.time_step +
+            sum(self.sending_pulses)/self.time_step
+        )
+        self.receive_error(
+            self.reg_coeff*(
+                self.firing_rate/self.num_neurons-self.target_firing_rate), 
+            "firing-rate"
+        )
+
         # Update adaptive thresholds: decay + spike-triggered increase
         self.adaptive_thresholds = (
             self.adaptive_thresholds * self.rho + self.sending_pulses
@@ -374,8 +384,7 @@ class ALIFLayer:
             + (
               self.low_pass_active_connections 
               - self.adaptative_eligibility_vector.multiply(self.betas.reshape(-1, 1))
-            )
-            .multiply(pseudo_derivatives) 
+            ).multiply(pseudo_derivatives) 
         )
         
         if self.self_predict_layer is not None:
@@ -383,7 +392,7 @@ class ALIFLayer:
                 self.input_spikes
                 # [:, self.recurrent_start:self.recurrent_start + self.num_neurons]
             )
-            if self.time_step % 1 == 0:
+            if self.time_step % 10 == 0:
                 error = (
                     self.self_predict_layer.compute_error(
                         self.sending_pulses[:self.num_neurons//1]
@@ -393,7 +402,9 @@ class ALIFLayer:
                 entropy_grad = -np.log(predict_output + 1e-9) - 1
                 lambda_entropy = 0.1  # Tune this value as needed
                 error += lambda_entropy * entropy_grad
+                self.receive_error(error, "self-predict")
                 self.self_predict_layer.accumulate_gradient(error)
+                
 
         # Reset accumulated inputs
         self.input_spikes = sp.csr_matrix((1, self.num_inputs))
@@ -407,18 +418,22 @@ class ALIFLayer:
 
         self.time_step += 1
 
-    def receive_error(self, errors, self_predict=False):
+    def receive_error(self, errors, loss_weights="base"):
         """Receive error signals and compute learning signals"""
         # Compute learning signal for each neuron
-        if not self_predict:
-            self.learning_signals = self.loss_weights @ errors
-        else:
-            self.learning_signals = self.self_predict_loss_weights @ errors
-
+        match loss_weights:
+            case "base":
+                learning_signals = self.loss_weights @ errors
+            case "self-predict":
+                learning_signals = self.self_predict_loss_weights @ errors
+            case "firing-rate":
+                float(errors)
+                learning_signals = np.full(self.num_neurons, errors)
+                
         # Compute updates only for existing weights
         rows, cols = self.weights.nonzero()
         weight_update_values = (
-            self.learning_signals[rows] * 
+            learning_signals[rows] * 
             self.low_pass_eligibility_traces[rows, cols].A1
         )
         weight_updates_sparse = sp.csr_matrix(
@@ -439,7 +454,7 @@ class ALIFLayer:
             self.self_predict_loss_weights[out_w.indices] = out_w[out_w.indices]
             
         # Scale gradients by batch size
-        gradients = self.accumulated_weight_updates / self.batch_size
+        gradients = self.accumulated_weight_updates
         
         # Increment Adam step counter
         self.adam_step += 1

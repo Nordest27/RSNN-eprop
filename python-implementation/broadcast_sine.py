@@ -5,9 +5,9 @@ from simple_broadcast_srnn import SimpleBroadcastSrnn
 from local_broadcast_srnn import LocalBroadcastSrnn
 from tqdm import tqdm
 
-np.random.seed(42)
+np.random.seed(102)
 
-def generate_sine_wave_sequences(n_samples=1000, seq_length=50, dt=0.1, noise_std=0.0, n_components=2):
+def generate_sine_wave_sequences(n_samples=1000, seq_length=50, dt=0.1, noise_std=0, n_components=5):
     """
     Generate sine wave sequences for next-value prediction.
     
@@ -29,8 +29,8 @@ def generate_sine_wave_sequences(n_samples=1000, seq_length=50, dt=0.1, noise_st
         for i in range(n_components):
             # Random starting phase and frequency for variety
             phase = np.random.uniform(0, 2*np.pi)
-            amplitude = np.random.uniform(0.5, 1.0)
-            frequency = np.random.uniform(0.01, 0.05)
+            amplitude = np.random.uniform(0.01, 1.0)
+            frequency = np.random.uniform(0.01, 0.5)
             sine_wave = amplitude * np.sin(2 * np.pi * frequency * t  + phase)
             wave += sine_wave
 
@@ -39,7 +39,8 @@ def generate_sine_wave_sequences(n_samples=1000, seq_length=50, dt=0.1, noise_st
         if noise_std > 0:
             wave += np.random.normal(0, noise_std, seq_length)
         
-        wave -= wave.min()
+        wave -= wave[0]
+        wave /= abs(wave).max()
 
         # Input is sequence of length seq_length, target is the next value
         inputs.append(wave.reshape(-1, 1))  # Input sequence
@@ -67,9 +68,9 @@ def encode_continuous_to_spikes(input_dim, values, duration=10, encoding_type='r
 
     spikes = np.zeros((duration, input_dim))
     for t in range(duration):
-        # spikes[t] = np.random.rand(input_dim) < spike_probs[t]
-        for i in range(input_dim):
-           spikes[t, i] = spike_probs[t] > i/input_dim
+        spikes[t] = np.random.rand(input_dim) < spike_probs[t]
+        # for i in range(input_dim):
+        #    spikes[t, i] = spike_probs[t] > i/input_dim
 
     return spikes
 
@@ -79,8 +80,6 @@ def run_sequence(input_dim, sequence, target, srnn: LocalBroadcastSrnn):
     duration = len(sequence)
     # Encode sequence to spikes
     spikes = encode_continuous_to_spikes(input_dim=input_dim, values=sequence, duration=duration, encoding_type='rate')
-    # noise = (np.random.rand(spikes.shape[0], spikes.shape[1]) < 0.01)
-    # spikes = np.maximum(spikes, noise)
 
     total_loss = 0
     predictions = []
@@ -91,19 +90,19 @@ def run_sequence(input_dim, sequence, target, srnn: LocalBroadcastSrnn):
     for t in range(duration):
         # Create input vector (sequence spikes + recurrent spikes)
         input_row = np.zeros((1, total_size))
-        condition = t < duration//2
-        if condition: 
-            input_row[0, :srnn.input_size] = spikes[t]
-        else:
-            noise = (np.random.rand(input_row.shape[0], input_row.shape[1]) < 0.1)
-            input_row = np.maximum(input_row, noise)
+        # condition = t < duration//2
+        # if condition: 
+        input_row[0, :srnn.input_size] = fixed_noise[t]
+        # else:
+        #     noise = (np.random.rand(input_row.shape[0], input_row.shape[1]) < 0.1)
+        #     input_row = np.maximum(input_row, noise)
         input_csr = sp.csr_matrix(input_row)
         # Step the network
         srnn.input(input_csr)
         output = srnn.output()
     
         predictions.append(output)
-        if target is not None and not condition:
+        if target is not None:
             total_loss += srnn.feedback(target[t])
 
     # Reset for next sequence
@@ -116,7 +115,7 @@ def train_regression(input_dim, srnn: LocalBroadcastSrnn, sequences, epochs=50, 
     n_samples = len(sequences)
     
     train_losses = []
-    
+
     for epoch in range(epochs):
         total_loss = 0
         mse_error = 0
@@ -193,7 +192,7 @@ if __name__ == "__main__":
     print("Generating sine wave sequences for next-value prediction...")
     
     # Generate data with shorter sequences for better learning
-    seq_length = 1000  # Length of input sequence
+    seq_length = 200  # Length of input sequence
     
     train_sequences = generate_sine_wave_sequences(
         n_samples=1, seq_length=seq_length,
@@ -202,15 +201,15 @@ if __name__ == "__main__":
     # Build broadcasting SRNN
     print("Building broadcasting SRNN network...")
     batch_size = 1
-    input_dim = 10
+    input_dim = 20
     n_hidden = 128
-    num_layers = 8
+    num_layers = 1
     num_neurons_list = [n_hidden for _ in range(num_layers)]
     output_size = 1
-    input_connectivity = 0.3
-    hidden_connectivity = 0.05
-    output_connectivity = 0.3
-    local_connectivity = 0.1
+    input_connectivity = 0.5
+    hidden_connectivity = 0.5
+    output_connectivity = 1.0
+    local_connectivity = 0.3
     # srnn = SimpleBroadcastSrnn(
     srnn = LocalBroadcastSrnn(
         num_neurons_list=num_neurons_list, 
@@ -222,12 +221,15 @@ if __name__ == "__main__":
         local_connectivity=local_connectivity,
         output_activation_function="linear",
         self_predict=True,
-        tau_out=2e-2,
+        # tau_out=20e-3,
         # unary_weights=True,
     )
     
     # Train network
     print("Training network...")
+
+    fixed_noise = (np.random.rand(seq_length, input_dim) < 0.25)
+    
     train_losses = train_regression(
         input_dim,
         srnn,
