@@ -5,8 +5,6 @@ from simple_broadcast_srnn import SimpleBroadcastSrnn
 from local_broadcast_srnn import LocalBroadcastSrnn
 from tqdm import tqdm
 
-np.random.seed(102)
-
 def generate_sine_wave_sequences(n_samples=1000, seq_length=50, dt=0.1, noise_std=0, n_components=5):
     """
     Generate sine wave sequences for next-value prediction.
@@ -20,6 +18,7 @@ def generate_sine_wave_sequences(n_samples=1000, seq_length=50, dt=0.1, noise_st
     Returns:
         inputs: Input sequences (n_samples, seq_length, 1)
     """
+    np.random.seed(102)
     inputs = []
     for _ in range(n_samples):
         
@@ -77,6 +76,8 @@ def encode_continuous_to_spikes(input_dim, values, duration=10, encoding_type='r
 
 def run_sequence(input_dim, sequence, target, srnn: LocalBroadcastSrnn):
     """Run a single sequence through the network for next-value prediction"""
+    # Reset for next sequence
+    srnn.reset()
     duration = len(sequence)
     # Encode sequence to spikes
     spikes = encode_continuous_to_spikes(input_dim=input_dim, values=sequence, duration=duration, encoding_type='rate')
@@ -105,6 +106,11 @@ def run_sequence(input_dim, sequence, target, srnn: LocalBroadcastSrnn):
         if target is not None:
             total_loss += srnn.feedback(target[t])
 
+
+    # Reset for next sequence
+    srnn.reset()
+    
+    
     # Reset for next sequence
     srnn.reset()
     
@@ -192,7 +198,7 @@ if __name__ == "__main__":
     print("Generating sine wave sequences for next-value prediction...")
     
     # Generate data with shorter sequences for better learning
-    seq_length = 200  # Length of input sequence
+    seq_length = 250  # Length of input sequence
     
     train_sequences = generate_sine_wave_sequences(
         n_samples=1, seq_length=seq_length,
@@ -202,14 +208,14 @@ if __name__ == "__main__":
     print("Building broadcasting SRNN network...")
     batch_size = 1
     input_dim = 20
-    n_hidden = 128
-    num_layers = 1
+    n_hidden = 500
+    num_layers = 4
     num_neurons_list = [n_hidden for _ in range(num_layers)]
     output_size = 1
-    input_connectivity = 0.5
-    hidden_connectivity = 0.5
-    output_connectivity = 1.0
-    local_connectivity = 0.3
+    input_connectivity = 0.3
+    hidden_connectivity = 0.05
+    output_connectivity = 0.3
+    local_connectivity = 0.1
     # srnn = SimpleBroadcastSrnn(
     srnn = LocalBroadcastSrnn(
         num_neurons_list=num_neurons_list, 
@@ -220,7 +226,8 @@ if __name__ == "__main__":
         output_connectivity=output_connectivity,
         local_connectivity=local_connectivity,
         output_activation_function="linear",
-        self_predict=True,
+        target_firing_rate=13,
+        # self_predict=True,
         # tau_out=20e-3,
         # unary_weights=True,
     )
@@ -234,7 +241,7 @@ if __name__ == "__main__":
         input_dim,
         srnn,
         train_sequences,
-        epochs=100,
+        epochs=2000,
         batch_size=batch_size
     )
     

@@ -1,13 +1,11 @@
-import enum
-from typing import List
 import numpy as np
 import scipy.sparse as sp
-from sympy.simplify.fu import L
 from srnn import ALIFLayer, OutputLayer 
 from visualize import SRNNVisualizer
 import torchvision
 import torchvision.transforms as transforms
 from tqdm import tqdm
+from line_profiler import profile
 
 
 def poisson_encode(image: np.ndarray, duration=100, max_prob=0.25):
@@ -89,7 +87,7 @@ def bucket_multiple_encode(images: list[np.ndarray], duration=100, discretizatio
 
     for i, image in enumerate(images):
         flat_image = image.flatten()
-        # Assign each pixel to a bucket (0 = brightest, discretization-1 = dimmest)
+        # Assign each pixel to a bucket (0 = brightest, discretization-1 = dimmest)y
         bucket_indices = (discretization - 1 - (flat_image * (discretization - 1)).astype(int)).clip(0, discretization - 1)
                 
         for t in range(duration):
@@ -100,9 +98,9 @@ def bucket_multiple_encode(images: list[np.ndarray], duration=100, discretizatio
     return spike_train
 
 def get_input(image, duration):
-    spikes = poisson_encode(image, duration=duration, max_prob=0.1)
+    # spikes = poisson_encode(image, duration=duration, max_prob=0.1)
     # spikes = freq_encode(image, duration=duration)
-    # spikes = bucket_encode(image, duration)
+    spikes = bucket_encode(image, duration)
     # spikes = bucket_cycle_encode(image, duration)
     # spikes = bucket_multiple_encode(image, duration=duration)
     # noise = (np.random.rand(spikes.shape[0], spikes.shape[1]) < 0.01)
@@ -162,10 +160,13 @@ def build_output_layer(num_outputs=10, num_hidden=100, connection_density=0.05):
         connection_density=connection_density,
     )
 
+@profile
 def run_single_image(image, label, hidden_layer, output_layer, duration):
     """
     Run a single image through the network.
     """
+    hidden_layer.reset()
+    output_layer.reset()
     spikes = get_input(image, duration)
     label = [label] if not isinstance(label, list) else label
     
@@ -208,11 +209,11 @@ def run_single_image(image, label, hidden_layer, output_layer, duration):
 
     # Reset layers for next image
     avg_firing_rate = hidden_layer.firing_rate
-    hidden_layer.reset()
-    output_layer.reset()
+ 
     
     return loss, outputs, avg_firing_rate
 
+@profile
 def train(hidden_layer, output_layer, images, labels, epochs=1, batch_size=10, duration=10):
     """
     Training loop with batch updates.
@@ -221,13 +222,14 @@ def train(hidden_layer, output_layer, images, labels, epochs=1, batch_size=10, d
         correct = 0
         total_loss = 0
         total_firing_rate = 0
+        total_self_predict_error = 0
         
         for i in tqdm(range(len(images)), total=len(images), desc=f"Epoch {epoch+1}"):
             img = images[i]
             lbl = [labels[i]]
             # Run single image
             loss, outputs, avg_firing_rate = run_single_image(img, lbl, hidden_layer, output_layer, duration)
-
+            total_self_predict_error += sum(hidden_layer.self_predict_error)
             for i in range(len(outputs)):
                 # Make prediction
                 pred = np.argmax(outputs[i])
@@ -257,7 +259,10 @@ def train(hidden_layer, output_layer, images, labels, epochs=1, batch_size=10, d
         acc = correct / len(images)
         avg_loss = total_loss / len(images)
         avg_fr = total_firing_rate / len(images)
-        print(f"Epoch {epoch+1} - Accuracy: {acc:.3f}, Average Loss: {avg_loss:.3f}, Firing Rate: {1000*avg_fr/hidden_layer.num_neurons:.3f} Hz")
+        avg_sp_error = total_self_predict_error / len(images)
+        print(
+            f"Epoch {epoch+1} - Acc: {acc:.3f}, AvgLoss: {avg_loss:.3f}, FR: {1000*avg_fr/hidden_layer.num_neurons:.3f} Hz, SP: {avg_sp_error}"
+        )
 
 # def test(hidden_layer, output_layer, images, labels, duration):
 #     """
@@ -289,7 +294,7 @@ if __name__ == "__main__":
     duration = 100
     batch_size = 1
     n_hidden = 64
-    images, labels = load_mnist(n_samples=25)
+    images, labels = load_mnist(n_samples=100)
     train_images, train_labels = images[:int(len(images)*0.8)], labels[:int(len(images)*0.8)]
     test_images, test_labels = images[int(len(images)*0.8):], labels[int(len(images)*0.8):]
     print(f"Loaded {len(train_images)} training samples")
@@ -309,15 +314,15 @@ if __name__ == "__main__":
     # Train network
     print("Training network...")
     train(hidden_layer, output_layer, train_images, train_labels, 
-          epochs=25, batch_size=batch_size, duration=duration)
+          epochs=100, batch_size=batch_size, duration=duration)
     
     # # Test on training data (you should use separate test data in practice)
     # print("Testing network...")
     # test(hidden_layer, output_layer, test_images, test_labels, duration)
 
-    print("Visualizing")
+    # print("Visualizing")
     while input("Visualize?"):
-        i = np.random.randint(len(train_images)-2)
+        i = np.random.randint(len(train_images))
         visualize_mnist(
             train_images[i],
             train_labels[i],

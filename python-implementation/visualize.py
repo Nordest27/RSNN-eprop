@@ -189,18 +189,19 @@ class SRNNVisualizer:
             hidden_indices = cols[indices]
             
             for i, (out_idx, hidden_idx) in enumerate(zip(output_indices, hidden_indices)):
-                # Position of hidden neuron
-                x1, y1 = self.neuron_positions[self.n_inps + hidden_idx]
-                # Position of output neuron
-                x2, y2 = self.output_positions[out_idx]
-                
-                weight = self.output_layer.weights[out_idx, hidden_idx]
-                line = self.ax_network.plot(
-                    [x1, x2], [y1, y2], 
-                    color='orange', alpha=0.3, 
-                    linewidth=min(3.0, abs(weight) * 5)
-                )[0]
-                self.output_connections.append((hidden_idx, out_idx, line))
+                if self.n_inps + hidden_idx < len(self.neuron_positions):
+                    # Position of hidden neuron
+                    x1, y1 = self.neuron_positions[self.n_inps + hidden_idx]
+                    # Position of output neuron
+                    x2, y2 = self.output_positions[out_idx]
+                    
+                    weight = self.output_layer.weights[out_idx, hidden_idx]
+                    line = self.ax_network.plot(
+                        [x1, x2], [y1, y2], 
+                        color='orange', alpha=0.3, 
+                        linewidth=min(3.0, abs(weight) * 5)
+                    )[0]
+                    self.output_connections.append((hidden_idx, out_idx, line))
         
     def create_neuron_layout(self):
         """Create a grid layout for neurons"""
@@ -299,11 +300,14 @@ class SRNNVisualizer:
         if self.output_layer is not None:
             hidden_output = self.lif_layer.get_output_spikes()
             if hidden_output.nnz > 0:
-                self.output_layer.receive_pulse(hidden_output)
-            self.output_layer.next_time_step()
+                if isinstance(self.output_layer, OutputLayer):
+                    self.output_layer.receive_pulse(hidden_output)
             
             # Store output probabilities
-            output_probs = self.output_layer.output()
+            if isinstance(self.output_layer, ALIFLayer):
+                output_probs = self.output_layer.get_output_spikes_dense()
+            else:
+                output_probs = self.output_layer.output()
             self.output_history.append(output_probs.copy())
         
         # Gather REAL data from the LIF layer
@@ -362,7 +366,7 @@ class SRNNVisualizer:
                     circle.set_radius(0.5)
                 else:
                     # Color based on probability
-                    intensity = prob / max_prob if max_prob > 0 else 0
+                    intensity = min(max(prob / max_prob if max_prob > 0 else 0, 1), 0)
                     circle.set_facecolor((0, intensity, 0))
                     circle.set_edgecolor('lime')
                     circle.set_linewidth(1)
