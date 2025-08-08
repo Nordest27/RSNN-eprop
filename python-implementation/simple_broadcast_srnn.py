@@ -173,7 +173,7 @@ class SimpleBroadcastSrnn:
         loss = self.output_layer.compute_loss(value)
         for q in self.input_queues:
             q.put(("FEEDBACK", errors))
-        self.output_layer.accumulate_gradient(errors)
+        self.output_layer.receive_error(errors)
         return loss
     
     def update_parameters(self):

@@ -98,9 +98,9 @@ def bucket_multiple_encode(images: list[np.ndarray], duration=100, discretizatio
     return spike_train
 
 def get_input(image, duration):
-    # spikes = poisson_encode(image, duration=duration, max_prob=0.1)
+    spikes = poisson_encode(image, duration=duration, max_prob=0.1)
     # spikes = freq_encode(image, duration=duration)
-    spikes = bucket_encode(image, duration)
+    # spikes = bucket_encode(image, duration)
     # spikes = bucket_cycle_encode(image, duration)
     # spikes = bucket_multiple_encode(image, duration=duration)
     # noise = (np.random.rand(spikes.shape[0], spikes.shape[1]) < 0.01)
@@ -126,7 +126,6 @@ def build_hidden_layer(
     num_hidden=100,
     input_connection_density=0.1,
     local_connection_density=0.05, 
-    batch_size=5
 ):
     """
     Build a hidden layer using LIFLayer instead of individual LIF neurons.
@@ -201,16 +200,14 @@ def run_single_image(image, label, hidden_layer, output_layer, duration):
         
         # Backpropagate to hidden layer
         hidden_layer.receive_error(error_signal)
-        
         # Accumulate gradients for output layer
-        output_layer.accumulate_gradient(error_signal)
+        output_layer.receive_error(error_signal)
 
         outputs.append(output_layer.output())
+        # Reset layers for next image
 
-    # Reset layers for next image
     avg_firing_rate = hidden_layer.firing_rate
  
-    
     return loss, outputs, avg_firing_rate
 
 @profile
@@ -230,10 +227,10 @@ def train(hidden_layer, output_layer, images, labels, epochs=1, batch_size=10, d
             # Run single image
             loss, outputs, avg_firing_rate = run_single_image(img, lbl, hidden_layer, output_layer, duration)
             total_self_predict_error += sum(hidden_layer.self_predict_error)
-            for i in range(len(outputs)):
+            for o in range(len(outputs)):
                 # Make prediction
-                pred = np.argmax(outputs[i])
-                if pred == lbl[i]:
+                pred = np.argmax(outputs[o])
+                if pred == lbl[o]:
                     correct += 1/len(outputs)
             
             # Compute loss for monitoring
@@ -253,7 +250,7 @@ def train(hidden_layer, output_layer, images, labels, epochs=1, batch_size=10, d
             output_layer.update_parameters()
             hidden_layer.update_parameters()
             out_w = output_layer.weights.T
-            hidden_layer.loss_weights[out_w.indices] = out_w[out_w.indices]        
+            hidden_layer.loss_weights[out_w.indices] = out_w[out_w.indices]     
     
         # Print epoch statistics
         acc = correct / len(images)
@@ -291,9 +288,9 @@ def visualize_mnist(image, label, hidden_layer, output_layer, duration):
 if __name__ == "__main__":
     # Load data
     print("Loading MNIST dataset...")
-    duration = 100
+    duration = 10
     batch_size = 1
-    n_hidden = 64
+    n_hidden = 128
     images, labels = load_mnist(n_samples=100)
     train_images, train_labels = images[:int(len(images)*0.8)], labels[:int(len(images)*0.8)]
     test_images, test_labels = images[int(len(images)*0.8):], labels[int(len(images)*0.8):]
@@ -304,12 +301,11 @@ if __name__ == "__main__":
     print("Building network...")
     hidden_layer = build_hidden_layer(
         num_hidden=n_hidden, 
-        input_connection_density=0.3,
-        local_connection_density=0.13,
-        batch_size=batch_size
+        input_connection_density=0.1,
+        local_connection_density=0.25,
     )
     print(hidden_layer.weights.nnz)
-    output_layer = build_output_layer(num_hidden=n_hidden, connection_density=0.3)
+    output_layer = build_output_layer(num_hidden=n_hidden, connection_density=0.1)
     print(output_layer.weights.nnz)
     # Train network
     print("Training network...")

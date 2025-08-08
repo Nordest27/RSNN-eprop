@@ -106,14 +106,6 @@ def run_sequence(input_dim, sequence, target, srnn: LocalBroadcastSrnn):
         if target is not None:
             total_loss += srnn.feedback(target[t])
 
-
-    # Reset for next sequence
-    srnn.reset()
-    
-    
-    # Reset for next sequence
-    srnn.reset()
-    
     return total_loss, predictions
 
 def train_regression(input_dim, srnn: LocalBroadcastSrnn, sequences, epochs=50, batch_size=10):
@@ -137,9 +129,7 @@ def train_regression(input_dim, srnn: LocalBroadcastSrnn, sequences, epochs=50, 
             loss, predictions = run_sequence(input_dim, seq, target_seq, srnn)
             
             total_loss += loss
-            half_size = len(target_seq)//2
-            pred = predictions[-half_size:]
-            mse_error += (pred - target_seq[-half_size:]) ** 2
+            mse_error += (predictions - target_seq) ** 2
             
             # Update parameters every batch_size samples
             if (i + 1) % batch_size == 0:
@@ -155,7 +145,7 @@ def train_regression(input_dim, srnn: LocalBroadcastSrnn, sequences, epochs=50, 
         avg_loss = total_loss / n_samples
         rmse = np.sqrt(mse_error / n_samples)
         train_losses.append(avg_loss)
-        print(f"Epoch {epoch+1} - Loss: {float(avg_loss):.4f}, RMSE: {float(np.mean(rmse)):.4f}")
+        print(f"Epoch {epoch+1} - Loss: {float(avg_loss):.4f}, MSE: {np.mean(rmse):.4f}")
     
     return train_losses
 
@@ -166,7 +156,8 @@ def plot_simple_example(sequences, srnn, seq_length=20):
     # true_future = sine_wave[1:]
     true_future = sequences[np.random.randint(len(sequences))]
 
-    _, predictions = run_sequence(input_dim, true_future, None, srnn)
+    for i in range(10):
+        _, predictions = run_sequence(input_dim, true_future, None, srnn)
 
     # Plot the complete example
     plt.figure(figsize=(12, 6))
@@ -208,8 +199,8 @@ if __name__ == "__main__":
     print("Building broadcasting SRNN network...")
     batch_size = 1
     input_dim = 20
-    n_hidden = 500
-    num_layers = 4
+    n_hidden = 200
+    num_layers = 15
     num_neurons_list = [n_hidden for _ in range(num_layers)]
     output_size = 1
     input_connectivity = 0.3
@@ -226,7 +217,7 @@ if __name__ == "__main__":
         output_connectivity=output_connectivity,
         local_connectivity=local_connectivity,
         output_activation_function="linear",
-        target_firing_rate=13,
+        # target_firing_rate=13,
         # self_predict=True,
         # tau_out=20e-3,
         # unary_weights=True,
@@ -241,7 +232,7 @@ if __name__ == "__main__":
         input_dim,
         srnn,
         train_sequences,
-        epochs=2000,
+        epochs=100,
         batch_size=batch_size
     )
     

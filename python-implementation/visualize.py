@@ -302,12 +302,11 @@ class SRNNVisualizer:
             if hidden_output.nnz > 0:
                 if isinstance(self.output_layer, OutputLayer):
                     self.output_layer.receive_pulse(hidden_output)
-            
-            # Store output probabilities
-            if isinstance(self.output_layer, ALIFLayer):
-                output_probs = self.output_layer.get_output_spikes_dense()
-            else:
-                output_probs = self.output_layer.output()
+                # Store output probabilities
+                elif isinstance(self.output_layer, ALIFLayer):
+                    output_probs = self.output_layer.get_output_spikes_dense()
+            self.output_layer.next_time_step()
+            output_probs = self.output_layer.output()
             self.output_history.append(output_probs.copy())
         
         # Gather REAL data from the LIF layer

@@ -89,13 +89,15 @@ class LocalBroadcastSrnn:
         self.output_layer = OutputLayer(
             num_hidden=input_size + num_hidden,
             num_outputs=output_size,
-            learning_rate=0.01,
+            learning_rate=0.001,
             connection_density=output_connectivity,
             activation_function=output_activation_function,
             # input_offset=self.layers_offsets[-1]
             unary_weights=unary_weights,
             tau_out=tau_out
         )
+
+        # print("OW:", self.output_layer.weights.nnz)
 
     @staticmethod
     def lif_worker(
@@ -113,6 +115,7 @@ class LocalBroadcastSrnn:
         # beta = abs(np.random.random())
         # print(f"Random beta: {beta}")
         layer = ALIFLayer(**config, recurrent_start=layer_offset)
+        # print(layer.weights.nnz)
         last_time = time.time_ns()
         how_many = 0
         how_many_pulses = 0
@@ -138,8 +141,6 @@ class LocalBroadcastSrnn:
                     how_many_pulses += 1
                 
                 case "NEXT_TIME_STEP":
-                    if how_many_pulses == 0:
-                        continue
                     if layer_id != 0:
                         left_input_queue.put(("NEXT_TIME_STEP", None))
                     layer.next_time_step()
@@ -184,9 +185,10 @@ class LocalBroadcastSrnn:
         self.input_queues[-1].put(("NEXT_TIME_STEP", None))
         # for q in self.input_queues[::-1]:
         #     q.put(("NEXT_TIME_STEP", None))
-        # for q in self.input_queues:
-        #     while(not q.empty()):
-        #         pass
+        for q in self.input_queues[::-1]:
+            time.sleep(0.001)
+            while(not q.empty()):
+                pass
         instruction, data = self.output_queue.get()
         self.output_layer.receive_pulse(data)
         self.output_layer.next_time_step()
@@ -200,7 +202,7 @@ class LocalBroadcastSrnn:
         loss = self.output_layer.compute_loss(label)
         for q in self.input_queues:
             q.put(("FEEDBACK", errors))
-        self.output_layer.accumulate_gradient(errors)
+        self.output_layer.receive_error(errors)
         return loss
     
     def update_parameters(self):
