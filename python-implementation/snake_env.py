@@ -6,10 +6,11 @@ import time
 import cv2
 
 class SnakeEnv:
-    def __init__(self, size=28, visible_range=7):
+    def __init__(self, size=28, visible_range=7, wait_inc=5):
         assert visible_range % 2 == 1, "visible_range must be odd"
         self.size = size
         self.visible_range = visible_range
+        self.wait_inc = wait_inc
         self.reset()
 
     def reset(self):
@@ -18,31 +19,41 @@ class SnakeEnv:
         self.dir_idx = 1
         self.direction = 'up'
 
-        self.spawn_apple()
+        self.apples = []
+        self.spawn_apples()
         self.done = False
         self.steps_since_last_apple = 0
+        self.wait_count = 0
         return self.get_observation()
 
-    def spawn_apple(self):
+    def spawn_apples(self):
         empty_cells = [(i, j) for i in range(self.size)
-                       for j in range(self.size) if (i, j) not in self.snake]
-        if len(empty_cells) > 0:
-            self.apple = random.choice(empty_cells)
-        else:
+                       for j in range(self.size) if (i, j) not in self.snake and (i, j) not in self.apples]
+        if np.ceil(np.sqrt(len(empty_cells))) > len(self.apples):
+            self.apples.extend(random.sample(empty_cells, k=int(np.ceil(np.sqrt(len(empty_cells))) - len(self.apples))))
+        if (empty_cells) == 0:
             self.done = True
         #self.apple = empty_cells[15%len(empty_cells)]
 
     def step(self, action):
+
         if self.done:
             raise Exception("Environment needs reset. Call env.reset().")
+        
+        if self.wait_count > 0:
+            self.wait_count -= 1
+            return self.get_observation(), 0.0, self.done
 
         dirs = ['left', 'up', 'right', 'down']
         new_dir = dirs[action]
+        
+        reward = -1.0
 
         # if (self.direction == 'up' and new_dir == 'down') or \
         #    (self.direction == 'down' and new_dir == 'up') or \
         #    (self.direction == 'left' and new_dir == 'right') or \
         #    (self.direction == 'right' and new_dir == 'left'):
+        #     reward -= 10
         #     new_dir = self.direction
 
         self.direction = new_dir
@@ -72,20 +83,27 @@ class SnakeEnv:
             head_x < 0 or head_x >= self.size or
             new_head in self.snake
         ):
+            reward -= 100
             self.done = True
-            return self.get_observation(), -100, True
+            return self.get_observation(), reward/100, True
 
         self.snake.insert(0, new_head)
 
-        reward = 0.0
-        if new_head == self.apple:
+        apple_found = None
+        for apple in self.apples:
+            if new_head == apple:
+                apple_found = apple
+                break
+
+        if apple_found is not None:
+            self.apples.remove(apple_found)
+            self.spawn_apples()
             reward = 100.0
-            self.spawn_apple()
             self.steps_since_last_apple = 0
         else:
             self.snake.pop()
             self.steps_since_last_apple += 1
-        
+
         if self.steps_since_last_apple > self.size**2:
             self.done = True
             return self.get_observation(), 0.0, True
@@ -93,8 +111,9 @@ class SnakeEnv:
         # reward = 0
         # if self.direction == "right":
         #     reward = 1
+        self.wait_count = self.wait_inc
 
-        return self.get_observation(), reward, self.done
+        return self.get_observation(), reward/100, self.done
 
     def get_observation(self):
         """
@@ -128,11 +147,12 @@ class SnakeEnv:
 
                 # # head
                 # if (y, x) == (head_y, head_x):
-                #     obs[1, local_y, local_x] = 1.0
+                #     obs[3, local_y, local_x] = 1.0
 
                 # apple
-                if (y, x) == self.apple:
-                    obs[1, local_y, local_x] = 1.0
+                for apple in self.apples:
+                    if (y, x) == apple:
+                        obs[1, local_y, local_x] = 1.0
 
         return obs.flatten()
 
@@ -142,8 +162,9 @@ class SnakeEnv:
             img[y, x] = [0, 255, 0]
         head_y, head_x = self.snake[0]
         img[head_y, head_x] = [0, 155, 0]
-        ay, ax = self.apple
-        img[ay, ax] = [0, 0, 255]
+        for apple in self.apples:
+            ay, ax = apple
+            img[ay, ax] = [0, 0, 255]
         return cv2.resize(img, (self.size * scale, self.size * scale), interpolation=cv2.INTER_NEAREST)
 
     def local_img(self, scale=10):

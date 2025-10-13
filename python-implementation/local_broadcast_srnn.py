@@ -18,10 +18,12 @@ class LocalBroadcastSrnn:
         layer_configs: list | None = None,
         output_activation_function: str = "softmax",
         tau_out: float = 30e-3,
+        tau_adaptation: float = 2000e-3,
         tau: float = 200e-3,
         unary_weights: bool = False,
         self_predict: bool = False,
         target_firing_rate: int = 13,
+        firing_threshold: float = 0.5,
         default_learning_rate: float = 1e-3,
         rl_gamma: float | None = None
     ):
@@ -65,7 +67,7 @@ class LocalBroadcastSrnn:
         default_lif_kwargs = dict(
             just_input_size=input_size,
             num_inputs=self.global_size,
-            firing_threshold=0.5,
+            firing_threshold=firing_threshold,
             learning_rate=default_learning_rate,
             learned_loss_learning_rate=1e-3,
             input_connection_density=input_connectivity,
@@ -78,6 +80,7 @@ class LocalBroadcastSrnn:
                 "value": 1
             },
             tau=tau,
+            tau_adaptation=tau_adaptation,
             tau_out=tau_out,
             target_firing_rate=target_firing_rate,
             beta="sparse_adaptive",
