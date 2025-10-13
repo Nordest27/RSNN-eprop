@@ -100,7 +100,7 @@ def load_mnist(n_samples=1000):
 # --- New run_single_image for broadcasting SRNN ---
 def run_single_image_broadcast(image, label, srnn: LocalBroadcastSrnn | SimpleBroadcastSrnn, duration):
     srnn.reset()
-    spikes = poisson_encode(image, duration=duration, max_prob=0.01)
+    spikes = poisson_encode(image, duration=duration, max_prob=0.1)
     # spikes = freq_encode(image, duration=duration)
     # spikes = bucket_encode(image, duration=duration)
 
@@ -116,12 +116,15 @@ def run_single_image_broadcast(image, label, srnn: LocalBroadcastSrnn | SimpleBr
         input_csr = sp.csr_matrix(input_row)
         # Step the network
         srnn.input(input_csr)
-        output = srnn.output()
 
-    # Prediction: class with most spikes
-    pred = np.argmax(output)
-    loss = srnn.feedback(label)
-    return loss, pred
+        action = srnn.action()
+        # action = srnn.output()
+        action_label = np.argmax(action)
+        reward = float(label==action_label)
+
+        adv = srnn.td_error_update(reward)
+        # adv = srnn.receive_feedback(label)
+    return adv, action_label
 
 # --- New train/test loops for broadcasting SRNN ---
 def train_broadcast(srnn: LocalBroadcastSrnn | SimpleBroadcastSrnn, images, labels, epochs=1, duration=10):
@@ -139,12 +142,12 @@ def train_broadcast(srnn: LocalBroadcastSrnn | SimpleBroadcastSrnn, images, labe
             b += 1
             if b == batch_size:
                 srnn.update_parameters()
-                srnn.update_outweights()
+                # srnn.update_outweights()
                 b = 0
 
         acc = correct / len(images)
         avg_loss = total_loss / len(images)
-        print(f"Epoch {epoch+1} - Accuracy: {acc:.3f}, Average Loss: {avg_loss:.3f}")
+        print(f"Epoch {epoch+1} - Accuracy: {acc:.3f}, Average Adv: {avg_loss:.3f}")
 
 def test_broadcast(srnn: LocalBroadcastSrnn | SimpleBroadcastSrnn, images, labels, duration):
     correct = 0
@@ -160,10 +163,10 @@ def test_broadcast(srnn: LocalBroadcastSrnn | SimpleBroadcastSrnn, images, label
 if __name__ == "__main__":
     # Load data
     print("Loading MNIST dataset...")
-    duration = 100
+    duration = 10
     batch_size = 1
-    n_hidden = 64
-    images, labels = load_mnist(n_samples=15)
+    n_hidden = 128
+    images, labels = load_mnist(n_samples=100)
     train_images, train_labels = images[:int(len(images)*0.8)], labels[:int(len(images)*0.8)]
     test_images, test_labels = images[int(len(images)*0.8):], labels[int(len(images)*0.8):]
     print(f"Loaded {len(train_images)} training samples")
@@ -171,14 +174,14 @@ if __name__ == "__main__":
 
     # Build broadcasting SRNN
     print("Building broadcasting SRNN network...")
-    num_layers = 8
+    num_layers = 10
     num_neurons_list = [n_hidden for _ in range(num_layers)]
     input_size = 784
     output_size = 10
     input_connectivity = 0.3
     hidden_connectivity = 0.025
     output_connectivity = 0.3
-    local_connectivity = 0.13
+    local_connectivity = 0.3
     # srnn = SimpleBroadcastSrnn(
     srnn = LocalBroadcastSrnn(
         num_neurons_list=num_neurons_list, 
@@ -188,8 +191,10 @@ if __name__ == "__main__":
         hidden_connectivity=hidden_connectivity,
         output_connectivity=output_connectivity,
         local_connectivity=local_connectivity,
+        rl_gamma=0.99,
+        default_learning_rate=1e-3,
         # self_predict=True,
-        target_firing_rate=13,
+        # target_firing_rate=13,
     )
 
     print(f"Number of neurons: {sum(num_neurons_list)}")

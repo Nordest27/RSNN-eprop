@@ -40,7 +40,7 @@ def generate_sine_wave_sequences(n_samples=1000, seq_length=50, dt=0.1, noise_st
         
         wave -= wave[0]
         wave /= abs(wave).max()
-
+        # wave = t / t[-1]
         # Input is sequence of length seq_length, target is the next value
         inputs.append(wave.reshape(-1, 1))  # Input sequence
     
@@ -82,7 +82,7 @@ def run_sequence(input_dim, sequence, target, srnn: LocalBroadcastSrnn):
     # Encode sequence to spikes
     spikes = encode_continuous_to_spikes(input_dim=input_dim, values=sequence, duration=duration, encoding_type='rate')
 
-    total_loss = 0
+    total_adv = 0
     predictions = []
 
     # Initialize
@@ -100,52 +100,85 @@ def run_sequence(input_dim, sequence, target, srnn: LocalBroadcastSrnn):
         input_csr = sp.csr_matrix(input_row)
         # Step the network
         srnn.input(input_csr)
-        output = srnn.output()
-    
-        predictions.append(output)
+
+        # action = srnn.output()
+        action = srnn.action()
+        # if t < duration -1:
+        #     output = srnn.output()
+        #     predictions.append(output)
+
+        predictions.append(action)
         if target is not None:
-            total_loss += srnn.feedback(target[t])
+            # total_adv += srnn.receive_feedback(target[t])
+            # reward = abs(action - target[t]) < 0.1
+            reward = -abs(action - target[t])
+            # print(reward, srnn.ac_output_layer.value_output.output())
+            total_adv += srnn.td_error_update(reward)
 
-    return total_loss, predictions
+    srnn.update_parameters()
+    return total_adv, predictions
 
-def train_regression(input_dim, srnn: LocalBroadcastSrnn, sequences, epochs=50, batch_size=10):
+def train_regression(
+    input_dim, srnn: LocalBroadcastSrnn, sequences, epochs=50, batch_size=10,
+    live_plot: bool = True):
     """Train the next-value prediction network"""
     n_samples = len(sequences)
     
     train_losses = []
 
+    it = 0
+    if live_plot:
+        # Initialize plot once
+        fig, ax = plt.subplots(figsize=(10, 4))
+        line_target, = ax.plot([], [], label="Target")
+        line_pred, = ax.plot([], [], label="Prediction", linestyle='--')
+        ax.set_xlabel("Timestep")
+        ax.set_ylabel("Amplitude")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        ax.set_title("Sine Prediction Over Time")
+        plt.ion()  # Turn on interactive mode
+        plt.show()
     for epoch in range(epochs):
         total_loss = 0
         mse_error = 0
         
         # Shuffle data
         indices = np.random.permutation(n_samples)
-        
+
         for i, idx in enumerate(tqdm(indices, desc=f"Epoch {epoch+1}")):
             seq = sequences[idx]
-            seq, target_seq = seq, seq #seq[:-1], seq[1:]
-            
+            seq, target_seq = seq, seq
+
             # Run sequence
             loss, predictions = run_sequence(input_dim, seq, target_seq, srnn)
-            
+
             total_loss += loss
             mse_error += (predictions - target_seq) ** 2
-            
-            # Update parameters every batch_size samples
-            if (i + 1) % batch_size == 0:
-                srnn.update_parameters()
-                srnn.update_outweights()
-        
-        # Final update if remaining samples
-        if n_samples % batch_size != 0:
-            srnn.update_parameters()
-            srnn.update_outweights()
+            it += 1
+
+            # Live update plot
+            if live_plot:
+                x = np.arange(len(seq))
+                line_target.set_data(x, target_seq)
+                line_pred.set_data(x, predictions)
+
+                ax.set_xlim(0, len(seq))
+                ymin = min(np.min(target_seq), np.min(predictions)) - 0.1
+                ymax = max(np.max(target_seq), np.max(predictions)) + 0.1
+                ax.set_ylim(ymin, ymax)
+
+                ax.set_title(f"Epoch {epoch+1}, Step {i+1}")
+                fig.canvas.draw()
+                fig.canvas.flush_events()
+                plt.pause(0.001)
+
         
         # Print statistics
         avg_loss = total_loss / n_samples
-        rmse = np.sqrt(mse_error / n_samples)
+        mse = mse_error / n_samples
         train_losses.append(avg_loss)
-        print(f"Epoch {epoch+1} - Loss: {float(avg_loss):.4f}, MSE: {np.mean(rmse):.4f}")
+        print(f"Epoch {epoch+1} - Adv: {float(avg_loss):.4f}, MSE: {float(np.mean(mse)):.4f}")
     
     return train_losses
 
@@ -156,8 +189,7 @@ def plot_simple_example(sequences, srnn, seq_length=20):
     # true_future = sine_wave[1:]
     true_future = sequences[np.random.randint(len(sequences))]
 
-    for i in range(10):
-        _, predictions = run_sequence(input_dim, true_future, None, srnn)
+    _, predictions = run_sequence(input_dim, true_future, true_future, srnn)
 
     # Plot the complete example
     plt.figure(figsize=(12, 6))
@@ -188,8 +220,7 @@ def plot_simple_example(sequences, srnn, seq_length=20):
 if __name__ == "__main__":
     print("Generating sine wave sequences for next-value prediction...")
     
-    # Generate data with shorter sequences for better learning
-    seq_length = 250  # Length of input sequence
+    seq_length = 100 # Length of input sequence
     
     train_sequences = generate_sine_wave_sequences(
         n_samples=1, seq_length=seq_length,
@@ -199,14 +230,14 @@ if __name__ == "__main__":
     print("Building broadcasting SRNN network...")
     batch_size = 1
     input_dim = 20
-    n_hidden = 200
-    num_layers = 15
+    n_hidden = 128
+    num_layers = 8
     num_neurons_list = [n_hidden for _ in range(num_layers)]
     output_size = 1
-    input_connectivity = 0.3
-    hidden_connectivity = 0.05
-    output_connectivity = 0.3
-    local_connectivity = 0.1
+    input_connectivity = 0.5
+    hidden_connectivity = 0.015
+    output_connectivity = 0.5
+    local_connectivity = 0.25
     # srnn = SimpleBroadcastSrnn(
     srnn = LocalBroadcastSrnn(
         num_neurons_list=num_neurons_list, 
@@ -217,6 +248,8 @@ if __name__ == "__main__":
         output_connectivity=output_connectivity,
         local_connectivity=local_connectivity,
         output_activation_function="linear",
+        default_learning_rate=1e-4,
+        rl_gamma=0.9,
         # target_firing_rate=13,
         # self_predict=True,
         # tau_out=20e-3,
@@ -232,7 +265,7 @@ if __name__ == "__main__":
         input_dim,
         srnn,
         train_sequences,
-        epochs=100,
+        epochs=1000,
         batch_size=batch_size
     )
     

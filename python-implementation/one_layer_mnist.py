@@ -1,12 +1,13 @@
 import numpy as np
 import scipy.sparse as sp
-from srnn import ALIFLayer, OutputLayer 
+from srnn import ALIFLayer, OutputLayer, ActorCriticOutputLayer
 from visualize import SRNNVisualizer
 import torchvision
 import torchvision.transforms as transforms
 from tqdm import tqdm
 from line_profiler import profile
 
+TAU_OUT = 3e-3
 
 def poisson_encode(image: np.ndarray, duration=100, max_prob=0.25):
     """
@@ -46,6 +47,8 @@ def freq_encode(image: np.ndarray, duration=100):
     return spike_train
 
 def bucket_encode(image: np.ndarray, duration=100, discretization=5):
+    discretization = min(discretization, duration)
+
     flat_image = image.flatten()
     spike_train = np.zeros((duration, 784), dtype=np.uint8)
 
@@ -121,9 +124,10 @@ def load_mnist(n_samples=1000):
         labels.append(lbl)
     return np.array(images), np.array(labels)
 
-def build_hidden_layer(
+def build_hidden_layers(
     num_inputs=784, 
     num_hidden=100,
+    num_outputs=10,
     input_connection_density=0.1,
     local_connection_density=0.05, 
 ):
@@ -136,11 +140,16 @@ def build_hidden_layer(
         num_inputs=num_inputs + num_hidden,
         num_neurons=num_hidden,
         learning_rate=1e-3,
+        tau_out=TAU_OUT,
         input_connection_density=input_connection_density,
         local_connection_density=local_connection_density,
-        output_size=10,
+        output_sizes={
+            "base": num_outputs,
+            "policy": num_outputs,
+            "value": 1
+        },
+        target_firing_rate=50,
         firing_threshold=1.0,
-        # self_predict=True,
         beta="sparse_adaptive",
         beta_params={
             "lif_fraction": 0.6,  # Fraction of LIF neurons
@@ -148,70 +157,172 @@ def build_hidden_layer(
             "max_beta": 2.0      # Maximum beta value
         }
     )
-    print(hidden_layer.analyze_beta_distribution())
-    return hidden_layer
-
-def build_output_layer(num_outputs=10, num_hidden=100, connection_density=0.05):
-    return OutputLayer(
-        num_hidden=num_hidden,
-        num_outputs=num_outputs,
-        learning_rate=1e-2,
-        connection_density=connection_density,
+    teacher_input = num_inputs + num_hidden
+    teacher_layer = ALIFLayer(
+        just_input_size=teacher_input,
+        num_inputs=teacher_input + num_hidden,
+        num_neurons=num_hidden,
+        learning_rate=1e-3,
+        tau_out=TAU_OUT,
+        input_connection_density=input_connection_density,
+        local_connection_density=local_connection_density,
+        output_sizes={
+            "policy": 2*num_hidden,
+            "value": 1,
+        },
+        firing_threshold=1.0,
+        beta="sparse_adaptive",
+        beta_params={
+            "lif_fraction": 0.6,  # Fraction of LIF neurons
+            "exp_scale": 0.2,    # Scale parameter for exponential distribution
+            "max_beta": 2.0      # Maximum beta value
+        }
     )
 
+    print(teacher_layer.analyze_beta_distribution())
+    return teacher_layer, hidden_layer
+
+def build_output_layers(num_outputs=10, num_hidden=100, connection_density=0.05):
+    return {
+        "base": OutputLayer(
+            num_hidden=num_hidden,
+            num_outputs=num_outputs,
+            learning_rate=1e-3,
+            tau_out=TAU_OUT,
+            connection_density=connection_density,
+            activation_function="softmax"
+        ),
+        "ac_number_predict": ActorCriticOutputLayer(
+            num_hidden=num_hidden,
+            num_outputs=num_outputs,
+            learning_rate=1e-3,
+            tau_out=TAU_OUT,
+            connection_density=connection_density,
+            policy_activation_function="softmax"
+        ),
+        "ac_learned_losses": ActorCriticOutputLayer(
+            num_hidden=num_hidden,
+            num_outputs=num_hidden,
+            learning_rate=1e-2,
+            tau_out=TAU_OUT,
+            connection_density=connection_density,
+            policy_activation_function="linear"
+        )
+    }
+
 @profile
-def run_single_image(image, label, hidden_layer, output_layer, duration):
-    """
-    Run a single image through the network.
-    """
+def run_single_image(
+    image, 
+    label, 
+    teacher_layer: ALIFLayer,
+    hidden_layer: ALIFLayer,
+    output_layers: list[OutputLayer | ActorCriticOutputLayer], 
+    duration
+):  
+    # teacher_layer.reset()
+    # hidden_layer.full_reset()
     hidden_layer.reset()
-    output_layer.reset()
+    for output_layer in output_layers.values():
+        output_layer.reset()
+
     spikes = get_input(image, duration)
     label = [label] if not isinstance(label, list) else label
-    
+
     spikes_shape = spikes.shape
-    spikes = sp.csr_matrix(spikes, shape=spikes_shape)
-    # Initialize output spike counts
+    spikes = sp.csr_array(spikes, shape=spikes_shape)
+
+    # teacher_output = teacher_layer.get_output_spikes()
     hidden_output = hidden_layer.get_output_spikes()
-    loss = None
     outputs = []
+    sequence = []
+    
     for t in range(duration):
+        sequence.append(spikes._getrow(t))
         input_spike_vector = sp.hstack([
-            spikes.getrow(t), 
+            spikes._getrow(t) if t < duration-1 else 0 * spikes._getrow(t), 
             hidden_output.reshape(1, -1)
         ])
-        # Feed input to hidden layer
         hidden_layer.receive_pulse(input_spike_vector)
         hidden_layer.next_time_step()
-        
-        # Get hidden layer output and feed to output layer
+
+        # teacher_input_spike_vector = sp.hstack([
+        #     spikes._getrow(t), 
+        #     hidden_output.reshape(1, -1),
+        #     teacher_output.reshape(1, -1)
+        # ])
+        # teacher_layer.receive_pulse(teacher_input_spike_vector)
+        # teacher_layer.next_time_step()
+
+        # teacher_output = teacher_layer.get_output_spikes()
         hidden_output = hidden_layer.get_output_spikes()
-        # if hidden_output.nnz > 0:  # Only if there are spikes
-        output_layer.receive_pulse(hidden_output)
-        output_layer.next_time_step()
+
+        # output_layers["base"].receive_pulse(hidden_output)
+        output_layers["ac_number_predict"].receive_pulse(hidden_output)
+        # output_layers["ac_learned_losses"].receive_pulse(teacher_output)
+        
+        # output_layers["base"].next_time_step()
+        output_layers["ac_number_predict"].next_time_step()
+        # output_layers["ac_learned_losses"].next_time_step()
+
+        # learned_losses = output_layers["ac_learned_losses"].action()
+        # prev_weights = hidden_layer.weights
+        # hidden_layer.receive_loss_signal(learned_losses)
+        # print(sum(sum(abs(prev_weights-hidden_layer.weights))))
+
+        # action = output_layers["base"].output()
+        
+        action = output_layers["ac_number_predict"].action()
+        action_label = np.argmax(action)
+        reward = 0
+        this_state_td_error = 0
+        if label[0] is not None:
+            aux_label = label
+            if isinstance(label, list):
+                aux_label = label[0]
+            reward = float(action_label==aux_label) * ((t+1)/duration)**2
+            # print(reward)
+
+            # supervised_error = output_layers["base"].compute_error(aux_label)
+            # output_layers["base"].receive_error(supervised_error)
+            # reward = -sum(abs(supervised_error))
+            # hidden_layer.receive_error(supervised_error)
+
+            policy_gradient, this_state_td_error, previous_policy_grads, previous_state_td_error = (
+                output_layers["ac_number_predict"].td_error_update(reward)
+            )
+            hidden_layer.receive_rl_gradient(
+                t,
+                policy_gradient, this_state_td_error, 
+                previous_policy_grads, previous_state_td_error
+            )
+            # policy_gradient, advantage = (
+            #     output_layers["ac_learned_losses"].receive_reward(reward)
+            # )
+            # teacher_layer.receive_rl_gradient(
+            #     policy_gradient, advantage,
+            # )
 
     if label[0] is not None:
-        aux_label = label
-        if isinstance(label, list):
-            aux_label = label[0]
-        # Compute error and backpropagate
-        error_signal = output_layer.compute_error(aux_label)
-        loss = output_layer.compute_loss(aux_label) + (loss if loss is not None else 0)
-        
-        # Backpropagate to hidden layer
-        hidden_layer.receive_error(error_signal)
-        # Accumulate gradients for output layer
-        output_layer.receive_error(error_signal)
+        hidden_layer.update_parameters()
+        # teacher_layer.update_parameters()
+        # output_layers["base"].update_parameters()
+        output_layers["ac_number_predict"].update_parameters()
+        # output_layers["ac_learned_losses"].update_parameters()
 
-        outputs.append(output_layer.output())
-        # Reset layers for next image
-
+    outputs.append(action)
     avg_firing_rate = hidden_layer.firing_rate
- 
-    return loss, outputs, avg_firing_rate
+    return reward, outputs, avg_firing_rate, output_layers["ac_number_predict"].value_output.output()[0], this_state_td_error
+
 
 @profile
-def train(hidden_layer, output_layer, images, labels, epochs=1, batch_size=10, duration=10):
+def train(
+    teacher_layer, hidden_layer, 
+    output_layers, images, 
+    labels, 
+    epochs=1, 
+    batch_size=10, 
+    duration=10
+):
     """
     Training loop with batch updates.
     """
@@ -219,69 +330,61 @@ def train(hidden_layer, output_layer, images, labels, epochs=1, batch_size=10, d
         correct = 0
         total_loss = 0
         total_firing_rate = 0
-        total_self_predict_error = 0
+        total_adv = 0
+        total_value = 0
         
         for i in tqdm(range(len(images)), total=len(images), desc=f"Epoch {epoch+1}"):
             img = images[i]
-            lbl = [labels[i]]
+            lbl = [labels[i]]*duration
             # Run single image
-            loss, outputs, avg_firing_rate = run_single_image(img, lbl, hidden_layer, output_layer, duration)
-            total_self_predict_error += sum(hidden_layer.self_predict_error)
+            loss, outputs, avg_firing_rate, value, adv = run_single_image(
+                img, lbl, teacher_layer, hidden_layer, output_layers, duration
+            )
+            total_adv += adv
+
             for o in range(len(outputs)):
-                # Make prediction
                 pred = np.argmax(outputs[o])
                 if pred == lbl[o]:
                     correct += 1/len(outputs)
             
-            # Compute loss for monitoring
             total_loss += loss
             total_firing_rate += avg_firing_rate
-            
-            # Update parameters every batch_size samples
-            if (i + 1) % batch_size == 0:
-                output_layer.update_parameters()
-                hidden_layer.update_parameters()
-                if (i + 1) % (10*batch_size) == 0:
-                    out_w = output_layer.weights.T
-                    hidden_layer.loss_weights[out_w.indices] = out_w[out_w.indices]
-
-        # Final parameter update if there are remaining samples
-        if len(images) % batch_size != 0:
-            output_layer.update_parameters()
-            hidden_layer.update_parameters()
-            out_w = output_layer.weights.T
-            hidden_layer.loss_weights[out_w.indices] = out_w[out_w.indices]     
-    
-        # Print epoch statistics
+            total_value += value
+ 
         acc = correct / len(images)
         avg_loss = total_loss / len(images)
         avg_fr = total_firing_rate / len(images)
-        avg_sp_error = total_self_predict_error / len(images)
+        avg_adv = total_adv / len(images)
+        avg_value = total_value / len(images)
         print(
-            f"Epoch {epoch+1} - Acc: {acc:.3f}, AvgLoss: {avg_loss:.3f}, FR: {1000*avg_fr/hidden_layer.num_neurons:.3f} Hz, SP: {avg_sp_error}"
+            f"Epoch {epoch+1} - Acc: {acc:.3f}, "
+            f"AvgReward: {avg_loss:.3f}, "
+            f"FR: {1000*avg_fr/hidden_layer.num_neurons:.3f} Hz, "
+            f"Value Estimate: {avg_value:.2f}, "
+            f"Value Error: {avg_adv:.2f}"
         )
 
-# def test(hidden_layer, output_layer, images, labels, duration):
-#     """
-#     Test the trained network.
-#     """
-#     correct = 0
+def test(teacher_layer, hidden_layer, output_layers, images, labels, duration):
+    """
+    Test the trained network.
+    """
+    correct = 0
 
-#     for img, lbl in tqdm(zip(images, labels), total=len(images), desc="Testing"):
-#         _, output = run_single_image(img, None, hidden_layer, output_layer, duration)
-#         pred = np.argmax(output[0])
-#         if pred == lbl:
-#             correct += 1
+    for img, lbl in tqdm(zip(images, labels), total=len(images), desc="Testing"):
+        output = run_single_image(img, None, teacher_layer, hidden_layer, output_layers, duration)[1]
+        pred = np.argmax(output[0])
+        if pred == lbl:
+            correct += 1
     
-#     acc = correct / len(images)
-#     print(f"Test Accuracy: {acc:.3f}")
-#     return acc
+    acc = correct / len(images)
+    print(f"Test Accuracy: {acc:.3f}")
+    return acc
 
-def visualize_mnist(image, label, hidden_layer, output_layer, duration):
+def visualize_mnist(image, label, hidden_layer, output_layers, duration):
     print(label)
     spikes = get_input(image, duration)
 
-    visualizer = SRNNVisualizer(hidden_layer, spikes, output_layer)
+    visualizer = SRNNVisualizer(hidden_layer, spikes, output_layers["ac_number_predict"].policy_output)
     visualizer.animate(interval=10)
 
 # Main execution
@@ -299,30 +402,29 @@ if __name__ == "__main__":
 
     # Build network
     print("Building network...")
-    hidden_layer = build_hidden_layer(
+    teacher_layer, hidden_layer = build_hidden_layers(
         num_hidden=n_hidden, 
-        input_connection_density=0.1,
-        local_connection_density=0.25,
+        input_connection_density=0.3,
+        local_connection_density=0.3
     )
-    print(hidden_layer.weights.nnz)
-    output_layer = build_output_layer(num_hidden=n_hidden, connection_density=0.1)
-    print(output_layer.weights.nnz)
+    output_layers = build_output_layers(num_hidden=n_hidden, connection_density=0.3)
+    # print(output_layer.weights.nnz)
     # Train network
     print("Training network...")
-    train(hidden_layer, output_layer, train_images, train_labels, 
-          epochs=100, batch_size=batch_size, duration=duration)
+    train(teacher_layer, hidden_layer, output_layers, train_images, train_labels, 
+          epochs=1000, batch_size=batch_size, duration=duration)
     
-    # # Test on training data (you should use separate test data in practice)
-    # print("Testing network...")
-    # test(hidden_layer, output_layer, test_images, test_labels, duration)
+    # Test on training data (you should use separate test data in practice)
+    print("Testing network...")
+    test(teacher_layer, hidden_layer, output_layers, test_images, test_labels, duration) 
 
     # print("Visualizing")
     while input("Visualize?"):
-        i = np.random.randint(len(train_images))
+        i = np.random.randint(len(test_images))
         visualize_mnist(
-            train_images[i],
-            train_labels[i],
+            test_images[i],
+            test_labels[i],
             hidden_layer, 
-            output_layer, 
+            output_layers, 
             1000
         )

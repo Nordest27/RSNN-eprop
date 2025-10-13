@@ -1,7 +1,48 @@
+from re import S
 import numpy as np
 import scipy.sparse as sp
 import time
 from line_profiler import profile
+
+
+class AdamOptimizer:
+    def __init__(
+        self,
+        shape: tuple,
+        beta1: float = 0.9,
+        beta2: float = 0.999,
+        epsilon: float = 1e-8,
+    ) -> None:
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.epsilon = epsilon
+        self.step = 0
+        self.m_weights = sp.csr_array(shape)
+        self.v_weights = sp.csr_array(shape)
+    
+    def get_update(self, gradients):
+        # Increment Adam step counter
+        self.step += 1
+
+        # Update biased first moment estimate (momentum)
+        self.m_weights = self.beta1 * self.m_weights + (1 - self.beta1) * gradients
+
+        # Update biased second moment estimate (RMSprop)
+        self.v_weights = self.beta2 * self.v_weights + (
+            1 - self.beta2
+        ) * gradients.multiply(gradients)
+
+        # Bias correction
+        m_hat = self.m_weights / (1 - self.beta1**self.step)
+        v_hat = self.v_weights / (1 - self.beta2**self.step)
+
+        s_v_hat_sqrt = np.sqrt(v_hat)
+        s_v_hat_sqrt.data += self.epsilon
+
+        # Compute Adam update
+        s_v_hat_sqrt.data = 1.0/s_v_hat_sqrt.data
+
+        return m_hat.multiply(s_v_hat_sqrt)
 
 
 class ALIFLayer:
@@ -179,37 +220,53 @@ class ALIFLayer:
         self.membrane_potentials = np.zeros(self.num_neurons)
         self.sending_pulses = np.zeros(self.num_neurons, dtype=bool)
         self.refractory_periods = np.zeros(self.num_neurons, dtype=int)
-        # self.input_spikes = sp.csr_array((1, self.num_inputs))
         self.input_spikes = np.zeros(self.num_inputs, dtype=bool)
 
         self.firing_rate = 0
+        # if self.firing_rate > self.target_firing_rate:
+            # self.weights *= .25
+        
+        # self.weights = self.initial_weights #+ self.weights*0.01
 
         # ALIF-specific: adaptive threshold components
         self.adaptive_thresholds = np.zeros(self.num_neurons)
 
         # Learning-related variables
+        self.low_pass_input = self.input_spikes * 0
         self.low_pass_active_connections = sp.csr_array(
             (self.num_neurons, self.num_inputs)
         )
         self.adaptative_eligibility_vector = sp.csr_array(
             (self.num_neurons, self.num_inputs)
         )
+        self.previous_low_pass_eligibility_traces = sp.csr_array(
+            (self.num_neurons, self.num_inputs)
+        )
         self.low_pass_eligibility_traces = sp.csr_array(
             (self.num_neurons, self.num_inputs)
         )
-        self.low_pass_rl_etrace = sp.csr_array(
-            (self.num_neurons, self.num_inputs)
-        )
+        # self.low_pass_rl_etrace = sp.csr_array(
+        #     (self.num_neurons, self.num_inputs)
+        # )
         self.input_spikes_record = []
         self.refractory_periods_record = []
         self.membrane_potentials_record = []
         self.effective_thresholds_record = []
+        self.firing_rates_record = []
         self.base_errors = []
-        self.temp_deltas = []
-        self.rl_learning_signals = []
+        self.time_steps = []
+        self.rl_signals_record = {}
+        # self.temp_deltas = []
+        # self.rl_learning_signals = []
+        # self.low_pass_rl_etraces_record = []
 
-        self.reward = 0
-        self.previous_value_estimation = 0
+        # self.reward = 0
+        # self.reward_trace = 0
+        
+        # self.previous_value_estimation = 0
+        # self.value_output.reset()
+        # self.policy_output.reset()
+        # self.policy_grads = None
 
         """
         if self.self_predict_layer is not None:
@@ -218,9 +275,35 @@ class ALIFLayer:
         
         self.last_time = time.time()
         self.time_step = 1
+        self.previous_rl_time_step = 1
+    
+    def full_reset(self):
+        self.weights = sp.csr_array(
+            (self.initial_weight_values, self.weight_mask.indices, self.weight_mask.indptr),
+            shape=(self.num_neurons, self.num_inputs),
+        )
+        # self.learned_losses_weights = sp.csr_array(
+        #     (self.learned_losses_initial_weight_values, self.learned_losses_weight_mask.indices, self.learned_losses_weight_mask.indptr),
+        #     shape=(self.num_neurons, self.num_inputs),
+        # )
 
-    def calculate_weight_mask(self):
+        self.base_weights_update = self.weights * 0
+        # self.learned_losses_weights_update = self.weights * 0
+        self.base_adam = AdamOptimizer(self.weights.shape, self.adam_beta1, self.adam_beta2, self.adam_epsilon)
+        # self.learned_losses_adam = AdamOptimizer(self.weights.shape, self.adam_beta1, self.adam_beta2, self.adam_epsilon)
+
+        self.error_counter = 0
+        self.firing_rate_error = 0
+
+        self.reset()
+
+    def calculate_weight_mask(
+        self,
+        input_connection_density: float | None = None
+    ):
         """Same as LIF layer - creates sparse connectivity pattern"""
+        if input_connection_density is None:
+            input_connection_density = self.input_connection_density
         external_size_1 = self.recurrent_start - self.just_input_size
         local_size = self.num_neurons
         external_size_2 = self.num_inputs - (self.recurrent_start + self.num_neurons)
@@ -228,7 +311,7 @@ class ALIFLayer:
         # Input mask
         input_mask = (
             np.random.rand(self.num_neurons, self.just_input_size)
-            < self.input_connection_density
+            < input_connection_density
         )
         input_mask = sp.csr_array(input_mask)
 
@@ -264,10 +347,12 @@ class ALIFLayer:
         just_input_size: int,
         num_inputs: int,
         num_neurons: int,
+        output_sizes: dict[str, int],
         recurrent_start: int | None = None,
         firing_threshold: float = 1.0,
         target_firing_rate: float = 13,
-        learning_rate: float = 0.01,
+        learning_rate: float = 0.001,
+        learned_loss_learning_rate: float = 1e-3,
         pseudo_derivative_slope: float = 0.3,
         input_connection_density: float = 0.1,
         hidden_connection_density: float = 0.1,
@@ -275,16 +360,15 @@ class ALIFLayer:
         tau=200e-3,
         tau_out=20e-3,
         dt=1e-3,
-        output_size: int = 1,
         self_predict: bool = False,
         # ALIF-specific parameters
         tau_adaptation=2000e-3,  # Adaptation time constant
         beta: float | str = 0.07,  # Adaptation coupling strength
         beta_params: dict | None = None,
         # Adam optimizer parameters
-        beta1: float = 0.9,
-        beta2: float = 0.999,
-        epsilon: float = 1e-8,
+        adam_beta1: float = 0.9,
+        adam_beta2: float = 0.999,
+        adam_epsilon: float = 1e-8,
     ):
         assert just_input_size + num_neurons <= num_inputs
 
@@ -293,7 +377,8 @@ class ALIFLayer:
         self.just_input_size = just_input_size
         self.num_inputs = num_inputs
         self.num_neurons = num_neurons
-        self.num_outputs = output_size
+        self.output_sizes = output_sizes
+
         self.recurrent_start = recurrent_start or (num_inputs - num_neurons)
 
         self.tau = tau
@@ -307,6 +392,7 @@ class ALIFLayer:
         self.firing_threshold = firing_threshold
         self.target_firing_rate = target_firing_rate / 1000
         self.learning_rate = learning_rate
+        self.learned_loss_learning_rate = learned_loss_learning_rate
         self.dampening_factor = pseudo_derivative_slope
 
         self.betas = self.initialize_beta_distribution(beta, num_neurons, beta_params)
@@ -317,140 +403,35 @@ class ALIFLayer:
         self.hidden_connection_density = hidden_connection_density
         self.local_connection_density = local_connection_density
 
-        # Adam optimizer parameters
-        self.beta1 = beta1
-        self.beta2 = beta2
-        self.epsilon = epsilon
-
         # Initialize weights
-        weight_mask = self.calculate_weight_mask()
-        weight_values = np.random.randn(weight_mask.nnz) / np.sqrt(num_inputs)
-        # weight_values = get_init_fluct_weights(num_neurons, firing_threshold, tau, weight_mask.nnz)
-        # print(weight_mask.indices)
-        # print(weight_mask.indptr)
-        self.weights = sp.csr_array(
-            (weight_values, weight_mask.indices, weight_mask.indptr),
-            shape=(num_neurons, self.num_inputs),
+        self.weight_mask = self.calculate_weight_mask()
+        self.initial_weight_values = np.random.randn(self.weight_mask.nnz) / np.sqrt(num_inputs)
+        self.initial_weights = sp.csr_array(
+            (self.initial_weight_values, self.weight_mask.indices, self.weight_mask.indptr),
+            shape=(self.num_neurons, self.num_inputs),
         )
+        # self.learned_losses_weight_mask = self.calculate_weight_mask()#input_connection_density=0.0)
+        # self.learned_losses_initial_weight_values = np.random.randn(self.learned_losses_weight_mask.nnz) / np.sqrt(num_inputs)
 
-        self.loss_weights = sp.random(num_neurons, output_size, density=1.0, format="csr")
-        
+        self.loss_weights_dict = {
+            output_name: sp.random(num_neurons, output_size, density=1.0, format="csr")
+            for output_name, output_size in self.output_sizes.items()
+        }
 
-        self.sp_num_neurons = int(np.sqrt(self.num_neurons))
-        # self.sp_num_neurons = self.num_neurons
-        # Initialize accumulated weight updates as sparse matrix
-        self.error_counter = 0
-        self.spls_counter = 0
-        self.frls_counter = 0
-        self.base_error = np.zeros(self.num_outputs)
-        self.self_predict_error = np.zeros(self.sp_num_neurons)
-        self.firing_rate_error = 0
+        self.adam_beta1 = adam_beta1
+        self.adam_beta2 = adam_beta2
+        self.adam_epsilon = adam_epsilon
 
-        # Initialize Adam optimizer state
-        self.adam_step = 0
-        self.m_weights = sp.csr_array((num_neurons, self.num_inputs))
-        self.v_weights = sp.csr_array((num_neurons, self.num_inputs))
-        
-        """
-        self.self_predict_layer = None
-        if self_predict:
-            self.self_predict_layer = ALIFLayer(
-                just_input_size=self.num_neurons,
-                num_inputs=self.num_neurons+self.sp_num_neurons,
-                num_neurons=self.sp_num_neurons,
-                output_size=self.sp_num_neurons,
-                dt=dt,
-                target_firing_rate=target_firing_rate,
-                tau=tau,
-                tau_adaptation=tau_adaptation,
-                input_connection_density=local_connection_density,
-                local_connection_density=1.0,
-                hidden_connection_density=local_connection_density,
-                beta=beta,
-                firing_threshold=firing_threshold,
-                beta_params=beta_params,
-                self_predict=False
-
-            )
-            self.self_predict_loss_weights = (
-                sp.random(num_neurons, self.sp_num_neurons, density=1.0, format="csr")
-            )
-        """
-
-        # RL stuff
-        self.policy_output = OutputLayer(
-            num_neurons,
-            num_neurons,
-            connection_density=0.5,
-            activation_function="linear"
-        )
-        self.policy_loss_signals_std = 0.01
-        self.policy_loss_weights = (np.random.randn(num_neurons, num_neurons))
-
-        self.value_output = OutputLayer(
-            num_neurons,
-            1,
-            activation_function="linear",
-            connection_density=0.5
-        )
-        self.value_loss_weights = (np.random.rand(num_neurons))
-        
-        self.gamma = 0.9
-        self.cv = 1
-        self.learned_loss_signals = 0
-        self.rl_weights_update = self.weights * 0
-        self.base_weights_update = self.weights * 0
-
-        self.reset()
+        self.full_reset()
 
     @profile
     def receive_pulse(self, spike_vector):
         """Receive input spikes"""
         self.input_spikes[spike_vector.indices] = True
 
-    def rl_next_time_step(self):
-        out = self.get_output_spikes()
-        self.policy_output.receive_pulse(out)
-        self.value_output.receive_pulse(out)
-        self.policy_output.next_time_step()
-        self.value_output.next_time_step()
-
-        value_estimation = self.value_output.output()[0]
-        self.temp_deltas.append(self.reward + self.gamma * value_estimation - self.previous_value_estimation)
-
-        self.previous_value_estimation = value_estimation
-        
-        self.loss_signals_means = self.policy_output.output()
-        
-        loss_signals = np.random.normal(self.loss_signals_means, self.policy_loss_signals_std)
-        self.learned_loss_signals += loss_signals
-
-        logp_gradient = (
-            (loss_signals - self.loss_signals_means)
-            /(self.policy_loss_signals_std**2)
-        )
-
-        self.rl_learning_signals.append(
-            -self.cv * self.value_loss_weights
-            + self.policy_loss_weights @ logp_gradient
-        )
-        self.reward = 0
-    
-    @profile
     def receive_error(self, error):
-        """Receive error signals and compute the running averages of the learning signals"""
         # Compute learning signal for each neuron
         self.error_counter += 1
-
-        self.reward += -sum(error)**2 -(self.firing_rate / self.num_neurons - self.target_firing_rate)**2
-        # self.base_error = (
-        #    self.base_error * ((self.error_counter - 1) / self.error_counter)
-        #    + error / self.error_counter
-        #)
-        # self.learning_signal = (
-        #    self.learning_signal * (self.bls_counter - 1) / self.bls_counter
-        #    + (self.loss_weights @ error) / self.bls_counter
-        # )
         self.base_errors[-1] = error
 
     @profile
@@ -458,11 +439,10 @@ class ALIFLayer:
         """Update all neurons for one time step - ALIF dynamics"""
         # Compute effective threshold (base + adaptive component)
         # A_j^t = v_th + βa_t^j
+        # self.receive_loss_signal(self.learned_loss_learning_rate * self.learned_losses_weights @ self.input_spikes)
+        
         self.base_errors.append(None)
         self.effective_thresholds = self.firing_threshold + np.multiply(self.betas, self.adaptive_thresholds)
-        # self.learning_signal = (
-        #    self.weights[:, self.recurrent_start: self.recurrent_start + self.num_neurons] @ self.learning_signal
-        #)
         
         self.membrane_potentials = (
             self.membrane_potentials * self.alpha
@@ -484,34 +464,13 @@ class ALIFLayer:
         self.adaptive_thresholds = (
             self.adaptive_thresholds * self.rho + self.sending_pulses
         )
-
-        """
-        if self.self_predict_layer is not None:
-            self.self_predict_layer.receive_pulse(
-                sp.hstack([
-                    self.input_spikes[
-                        self.recurrent_start : self.recurrent_start + self.num_neurons
-                    ],
-                    self.self_predict_layer.sending_pulses
-                ]).tocsr()
-            )
-            self.self_predict_layer.next_time_step()
-            error = self.self_predict_layer.sending_pulses - self.sending_pulses[: self.sp_num_neurons]
-            # entropy_grad = -np.log(predict_output + 1e-9) - 1
-            # lambda_entropy = 0.0  # Tune this value as needed
-            # error -= lambda_entropy * entropy_grad
-            # if self.time_step > 90:
-            #     print(self.self_predict_layer.sending_pulses, "-", self.sending_pulses[: self.sp_num_neurons], "=", error)
-            self.receive_error(error, "self-predict")
-            self.self_predict_layer.receive_error(error)
-        """
-
-        # self.rl_next_time_step()
         
         self.input_spikes_record.append(self.input_spikes.copy())
         self.refractory_periods_record.append(self.refractory_periods.copy())
         self.membrane_potentials_record.append(self.membrane_potentials.copy())
         self.effective_thresholds_record.append(self.effective_thresholds.copy())
+        self.firing_rates_record.append(self.firing_rate)
+        self.time_steps.append(self.time_step)
 
         # Reset accumulated inputs
         self.input_spikes[:] = False
@@ -523,6 +482,50 @@ class ALIFLayer:
             np.maximum(0, self.refractory_periods - 1),  # Decrement for others
         )
         self.time_step += 1
+    
+
+    def no_grad_predict(self, input_sequence):
+        no_grad_membrane_potentials = self.membrane_potentials * 0
+        no_grad_refractory_periods = self.refractory_periods * 0
+        no_grad_sending_pulses = self.sending_pulses * 0
+        no_grad_adaptive_thresholds = self.adaptive_thresholds * 0
+
+        output = []
+
+        for ts_v in input_sequence:
+            no_grad_input_spikes = sp.hstack([
+                ts_v,
+                no_grad_sending_pulses.reshape(1, -1)
+            ]).todense().reshape(-1)
+
+            no_grad_effective_thresholds = (
+                self.firing_threshold + 
+                np.multiply(self.betas, no_grad_adaptive_thresholds)
+            )
+            no_grad_membrane_potentials = (
+                no_grad_membrane_potentials * self.alpha
+                + self.weights @ no_grad_input_spikes
+                - no_grad_effective_thresholds * no_grad_sending_pulses
+            )
+
+            no_grad_sending_pulses = np.where(
+                no_grad_refractory_periods == 0,
+                no_grad_membrane_potentials - no_grad_effective_thresholds > 0,
+                0,
+            )
+            no_grad_adaptive_thresholds = (
+                no_grad_adaptive_thresholds * self.rho + no_grad_sending_pulses
+            )
+            no_grad_refractory_periods = np.where(
+                no_grad_sending_pulses,
+                3,
+                np.maximum(0, no_grad_refractory_periods - 1),  # Decrement for others
+            )
+
+            output.append(no_grad_sending_pulses.copy())
+        
+        return output
+
 
     def h_pseudo_derivative(
         self,
@@ -534,6 +537,7 @@ class ALIFLayer:
         # ψ_j^t = (1/v_th) * γ_pd * max(0, 1 - |v_j - A_j^t|/v_th)
         # Set derivative to 0 for neurons in refractory period
         active_neurons = refractory_periods <= 0
+
         mp_scaled = (
             membrane_potentials[active_neurons]
             - effective_thresholds[active_neurons]
@@ -541,135 +545,182 @@ class ALIFLayer:
         derivatives = np.zeros(self.num_neurons)
         derivatives[active_neurons] = (
             (self.dampening_factor / self.firing_threshold)
-            * np.maximum(0., 1. - np.abs(mp_scaled))
+            * np.maximum(0.0, 1. - np.abs(mp_scaled))
         )
+
         return derivatives
     
+    def compute_rl_learning_signal(
+        self, signal_time_step, 
+        low_pass_eligibility_traces,
+        previous_low_pass_eligibility_traces,
+        policy_loss_weights_name="policy",
+        value_loss_weights_name="value",
+
+    ):
+        if signal_time_step in self.rl_signals_record:
+            (
+                policy_gradient, this_state_td_error, 
+                previous_policy_grads, previous_state_td_error
+            ) = self.rl_signals_record[signal_time_step]
+
+            rl_learning_signal = - this_state_td_error * (
+                (self.loss_weights_dict[policy_loss_weights_name] @ policy_gradient)
+                - self.loss_weights_dict[value_loss_weights_name].todense().reshape(-1)
+            )
+            rl_previous_learning_signal = - previous_state_td_error * (
+                (self.loss_weights_dict[policy_loss_weights_name] @ previous_policy_grads)
+                - self.loss_weights_dict[value_loss_weights_name].todense().reshape(-1)
+            )
+            # self.learned_losses_weights_update += -self.learned_loss_learning_rate * (
+            #     (np.sum(rl_learning_signal.reshape(-1, 1) 
+            #     * self.low_pass_eligibility_traces
+            #     * prev_low_pass_e_trace, axis=1) *
+            #     self.learned_losses_active_connections.T)
+            # ).T
+
+            self.base_weights_update += (
+                rl_learning_signal.reshape(-1, 1) 
+                * low_pass_eligibility_traces
+            ) + (
+                rl_previous_learning_signal.reshape(-1, 1)
+                * previous_low_pass_eligibility_traces
+            )
+    
     @profile
-    def compute_elegibility_traces(self):
-        firing_rate_error = (
-            self.firing_rate / self.num_neurons - self.target_firing_rate
-        )
+    def compute_elegibility_traces(self, base_loss_weights_name: str):
         # Update eligibility vectors
         pseudo_derivatives = []
+        voltage_errors = []
         for (rf, mp, et) in zip(
             self.refractory_periods_record, 
             self.membrane_potentials_record, 
             self.effective_thresholds_record
         ):
             pseudo_derivatives.append(
-                self.h_pseudo_derivative(rf, mp, et
+                self.h_pseudo_derivative(
+                    rf, mp, et
             ).reshape(-1, 1))
-
+            
+            # voltage regularization
+            voltage_errors.append(
+                np.maximum(mp - et, 0) #a+ np.maximum(-mp - et, 0)
+            )
         for (
-                ip, pd, err
-                # delta, rl_ls
+                t, ip, pd, err, fr, ve
             ) in zip(
+            self.time_steps,
             self.input_spikes_record,
             pseudo_derivatives,
-            self.base_errors
-            # self.temp_deltas,
-            # self.rl_learning_signals
+            self.base_errors,
+            self.firing_rates_record,
+            voltage_errors
         ):
             self.low_pass_active_connections = (
                 self.low_pass_active_connections * self.alpha
                 + (self.weights * ip) != 0
             )
-            # print(self.betas.shape)
-            # print(pseudo_derivatives.shape)
-            # print(np.multiply(self.betas, pseudo_derivatives).shape)
+            # self.learned_losses_active_connections = (self.learned_losses_weights * ip) != 0
+
             self.adaptative_eligibility_vector = (
                 self.adaptative_eligibility_vector * (
                     self.rho - self.betas_col * pd
                 )
                 + self.low_pass_active_connections * pd
             )
-            # Update low-pass eligibility traces
+
+            elegibility_vector = (
+                self.low_pass_active_connections
+                - self.adaptative_eligibility_vector * self.betas_col
+            )
+            
+            self.previous_low_pass_eligibility_traces = self.low_pass_eligibility_traces.copy()
             self.low_pass_eligibility_traces = (
-                self.low_pass_eligibility_traces * self.kappa + (
-                    self.low_pass_active_connections
-                    - self.adaptative_eligibility_vector * self.betas_col
-                ) * pd
+                self.low_pass_eligibility_traces * self.kappa + elegibility_vector * pd
             )
+
+            self.firing_rate_error = (
+                fr / self.num_neurons - self.target_firing_rate
+            )
+
+            learning_signal = self.firing_rate_error
             if err is not None:
-                learning_signal = self.loss_weights @ err
-                learning_signal += firing_rate_error
+                learning_signal = self.loss_weights_dict[base_loss_weights_name] @ err
 
-                self.base_weights_update += (
-                    learning_signal.reshape(-1, 1) * self.low_pass_eligibility_traces
-                )
-
-            """
-            self.low_pass_rl_etrace = (
-                self.low_pass_rl_etrace*self.gamma + 
-                self.low_pass_eligibility_traces * rl_ls.reshape(-1, 1)
+            # self.learned_losses_weights_update += -self.learned_loss_learning_rate * (
+            #     (np.sum(learning_signal.reshape(-1, 1) 
+            #     * self.low_pass_eligibility_traces
+            #     * prev_low_pass_e_trace, axis=1) *
+            #     self.learned_losses_active_connections.T)
+            # ).T
+            
+            self.base_weights_update += (
+                # self.firing_rate_error * self.low_pass_eligibility_traces
+                learning_signal.reshape(-1, 1) * self.low_pass_eligibility_traces
+                # Voltage Regularization
+                + 0.1 * ve.reshape(-1, 1) * elegibility_vector
             )
-            self.rl_weights_update += delta * self.low_pass_rl_etrace / len(self.temp_deltas)
-            """
+            self.compute_rl_learning_signal(
+                t, self.low_pass_eligibility_traces,
+                self.previous_low_pass_eligibility_traces
+            )
+
+            # print(sum(abs(ve)))
+                
         self.input_spikes_record = []
         self.refractory_periods_record = []
-        self.membrane_potentials_record = []
+        self.membrane_potentials_record = [] 
         self.effective_thresholds_record = []
+        self.firing_rates_record = []
         self.base_errors = []
-        self.temp_deltas = []
         self.rl_learning_signals = []
+        self.learned_loss_signals_record = []
+        self.time_steps = []
+        self.rl_signals_record = {}
 
     @profile
-    def update_parameters(self):
+    def update_parameters(self, base_loss_weights_name="base"):
         """Apply accumulated weight updates using Adam optimizer"""
-        self.compute_elegibility_traces()
+        self.compute_elegibility_traces(base_loss_weights_name)
 
-        weight_updates_sparse = (
-           self.base_weights_update
-           # + self.rl_weights_update
-        )
-        """
-        if self.self_predict_layer is not None:
-            self.self_predict_layer.update_parameters()
-            start = self.recurrent_start
-            end = start + self.num_neurons
-            out_w = self.self_predict_layer.weights[:, start:end].T
-            self.self_predict_loss_weights[out_w.indices] = out_w[out_w.indices]
-        """
+        update = self.base_adam.get_update(self.base_weights_update)
+        masked_update = update.multiply(self.weights != 0)
+        self.weights = self.weights - self.learning_rate * masked_update
 
-        # Scale gradients by batch size
-        gradients = weight_updates_sparse
+        # update = self.learned_losses_adam.get_update(self.learned_losses_weights_update)
+        # masked_update = update.multiply(self.learned_losses_weights != 0)
+        # self.learned_losses_weights = self.learned_losses_weights - self.learning_rate * masked_update
 
-        # Increment Adam step counter
-        self.adam_step += 1
-
-        # Update biased first moment estimate (momentum)
-        self.m_weights = self.beta1 * self.m_weights + (1 - self.beta1) * gradients
-
-        # Update biased second moment estimate (RMSprop)
-        self.v_weights = self.beta2 * self.v_weights + (
-            1 - self.beta2
-        ) * gradients.multiply(gradients)
-
-        # Bias correction
-        m_hat = self.m_weights / (1 - self.beta1**self.adam_step)
-        v_hat = self.v_weights / (1 - self.beta2**self.adam_step)
-
-        s_v_hat_sqrt = np.sqrt(v_hat)
-        s_v_hat_sqrt.data += self.epsilon
-
-        # Compute Adam update
-        s_v_hat_sqrt.data = 1.0/s_v_hat_sqrt.data
-        update_sparse = self.learning_rate * m_hat.multiply(s_v_hat_sqrt)
-
-        # Only update weights that exist (multiply by weight mask)
-        masked_update = update_sparse.multiply(self.weights != 0)
-
-        # l2_lambda = 1e-3
-        # l2_penalty = l2_lambda * self.weights
-
-        # # Apply L2 penalty during weight updates
-        self.weights = self.weights - masked_update
-
-        self.rl_weights_update *= 0
         self.base_weights_update *= 0
-        self.firing_rate_error = 0
-        self.learned_loss_signals = 0
+        # self.learned_losses_weights_update *= 0
+
+    @profile
+    def receive_rl_gradient(
+        self, 
+        signal_time_step,
+        policy_gradient, this_state_td_error, 
+        previous_policy_grads, previous_state_td_error
+    ):
+        self.rl_signals_record[signal_time_step] = (
+            policy_gradient, this_state_td_error, 
+            previous_policy_grads, previous_state_td_error
+        )
+
+        return this_state_td_error
+
+    # def receive_loss_signal(
+    #     self, loss_signal, 
+    #     base_loss_weights_name: str = "base"
+    # ):
+    #     self.compute_elegibility_traces(base_loss_weights_name)
+    #     arbitrary_update = (
+    #         loss_signal.reshape(-1, 1) * self.low_pass_eligibility_traces
+    #     )
+        
+    #     masked_update = arbitrary_update.multiply(self.weights != 0)
+    #     # prev_weights = self.weights
+    #     self.weights = self.weights - masked_update
+    #     # print(sum(sum(abs(prev_weights - self.weights))))
 
     def get_output_spikes(self):
         """Return current spike outputs as sparse matrix"""
@@ -694,18 +745,6 @@ class ALIFLayer:
     def get_effective_thresholds(self):
         """Return current effective thresholds (base + adaptive)"""
         return self.firing_threshold + self.adaptive_thresholds.multiply(self.betas)
-
-    def get_adam_stats(self):
-        """Return current Adam optimizer statistics for debugging"""
-        return {
-            "step": self.adam_step,
-            "beta1": self.beta1,
-            "beta2": self.beta2,
-            "epsilon": self.epsilon,
-            "lr": self.learning_rate,
-            "m_weights_nnz": self.m_weights.nnz,
-            "v_weights_nnz": self.v_weights.nnz,
-        }
 
     def get_alif_stats(self):
         """Return ALIF-specific statistics"""
@@ -738,10 +777,12 @@ class ALIFLayer:
 
 
 class OutputLayer:
+
     def reset(self):
         self.input_spikes = np.zeros(self.num_hidden)
         self.values = np.zeros(self.num_outputs)
         self.low_pass_input = np.zeros(self.num_hidden)
+        self.previous_low_pass_input = np.zeros(self.num_hidden)
         self.last_time = time.time()
 
     def __init__(
@@ -754,9 +795,19 @@ class OutputLayer:
         tau_out=20e-3,
         dt=1e-3,
         activation_function: str = "softmax",  # 'linear', 'softmax'
-        unary_weights: bool = False,
+        rl_gamma: float | None = None,
+        is_policy: bool | None = None,
+        # Adam optimizer parameters
+        adam_beta1: float = 0.9,
+        adam_beta2: float = 0.999,
+        adam_epsilon: float = 1e-8,
+        use_bias: bool = True
     ):
-        self.unary_weights = unary_weights
+        self.rl_gamma = rl_gamma
+        self.use_bias = use_bias 
+        assert self.rl_gamma is not None or is_policy is None
+        self.is_policy = is_policy
+        
         self.activation_function = activation_function
         assert self.activation_function in ["softmax", "linear", "sigmoid"]
 
@@ -766,32 +817,33 @@ class OutputLayer:
 
         self.tau_out = tau_out
         self.kappa = np.exp(-dt / self.tau_out)
-        # print(self.kappa)
+        print(f"KAPPA: {self.kappa}")
         # Sparse initialization with input_offset: zero out columns < input_offset
-        weight_mask = sp.random(
+        weights_mask = sp.random(
             num_outputs, num_hidden, density=connection_density, format="csr"
         )
         if input_offset > 0:
             # Zero out all columns < input_offset
-            mask = weight_mask.toarray()
+            mask = weights_mask.toarray()
             mask[:, :input_offset] = 0
-            weight_mask = sp.csr_array(mask)
+            weights_mask = sp.csr_array(mask)
 
-        if self.unary_weights:
-            weight_values = np.ones(weight_mask.nnz) / weight_mask.nnz
-        else:
-            weight_values = np.random.randn(weight_mask.nnz) / np.sqrt(num_hidden)
-
+        weight_values = np.random.randn(weights_mask.nnz) / np.sqrt(num_hidden)
         self.weights = sp.csr_array(
-            (weight_values, weight_mask.indices, weight_mask.indptr),
+            (weight_values, weights_mask.indices, weights_mask.indptr),
             shape=(num_outputs, num_hidden),
         )
         self.non_zero_weights = self.weights != 0
+
+        self.adam_optimizer = AdamOptimizer(
+            self.weights.shape, adam_beta1, adam_beta2, adam_epsilon
+        )
+        
         self.bias = np.zeros(num_outputs)
 
-        # Accumulate gradients using dense matrix for simplicity
-        self.accumulated_weights_update = sp.csr_array((num_outputs, num_hidden))
-        self.accumulated_bias_update = np.zeros_like(self.bias)
+        self.accumulated_weights_update = self.weights * 0
+        self.accumulated_bias_update = self.bias * 0
+
         self.errors_received = 0
 
         self.reset()
@@ -802,6 +854,7 @@ class OutputLayer:
     @profile
     def next_time_step(self):
         # Convert to dense for single timestep usage
+        self.previous_low_pass_input = self.low_pass_input.copy()
         self.low_pass_input = (
             self.kappa * self.low_pass_input
             + self.input_spikes
@@ -813,9 +866,26 @@ class OutputLayer:
         )
         self.input_spikes *= 0
 
+    def no_grad_predict(self, input_sequence, target=None):
+        no_grad_values = self.values * 0
+
+        for ts_v in input_sequence:
+            no_grad_values = (
+                self.kappa * no_grad_values
+                + self.weights @ ts_v
+            )
+
+        return (
+            self.output(no_grad_values),
+            self.compute_error(target, no_grad_values) if target is not None else None,
+            self.compute_loss(target, no_grad_values) if target is not None else None
+        )
+
     @profile
-    def output(self):
-        biased_values = self.values + self.bias
+    def output(self, values=None):
+        assert values is None
+        values = values if values is not None else self.values
+        biased_values = values + self.bias * (self.use_bias)
         if self.activation_function == "softmax":
             exps = np.exp(biased_values - np.max(biased_values))
             return exps / np.sum(exps)
@@ -824,15 +894,16 @@ class OutputLayer:
         else:
             return biased_values
 
-    def compute_loss(self, target: int | np.ndarray):
-        output = self.output()
+    def compute_loss(self, target: int | np.ndarray, values=None):
+        output = self.output(values)
         if self.activation_function == "softmax":
             return -np.log(output[target] + 1e-9)
         else:
             return 0.5 * np.sum((output - target) ** 2)
 
-    def compute_error(self, target: int | np.ndarray):
-        output = self.output()
+    def compute_error(self, target: int | np.ndarray, values=None):
+        # print(values)
+        output = self.output(values)
         if self.activation_function == "softmax":
             output[target] -= 1
             return output
@@ -840,30 +911,202 @@ class OutputLayer:
             return output - target
     
     @profile
-    def receive_error(self, error_signal: np.ndarray):
-        if self.unary_weights:
-            return
+    def receive_error(self, error_signal: np.ndarray, use_previous_state: bool = False):
         self.errors_received += 1
         # Outer product: error_signal (num_outputs) x low_pass_input (num_hidden)
-        grad_dense = np.outer(error_signal, self.low_pass_input)
+        if not use_previous_state:
+            grad_dense = np.outer(error_signal, self.low_pass_input)
+        else:
+            grad_dense = np.outer(error_signal, self.previous_low_pass_input)
 
         # Only accumulate updates on the current sparse structure of weights
-        self.accumulated_weights_update += self.non_zero_weights*grad_dense
+        self.accumulated_weights_update += self.non_zero_weights * grad_dense
         self.accumulated_bias_update += error_signal
 
     @profile
     def update_parameters(self):
-        if self.unary_weights or self.errors_received == 0:
+        if self.errors_received == 0:
             return
-        # Update only the non-zero weights
         
-        # l2_lambda = 1e-3
-        # l2_penalty = l2_lambda * self.weights
-        self.weights = self.weights -self.learning_rate*self.accumulated_weights_update/self.errors_received
+        weights_update = self.non_zero_weights * self.adam_optimizer.get_update(
+            self.accumulated_weights_update
+        )
+        self.weights -= (
+            self.learning_rate * weights_update
+        )
 
-        self.bias -= self.learning_rate * self.accumulated_bias_update
-
+        self.bias = self.bias - self.learning_rate * (
+            self.accumulated_bias_update
+        )
+        
         # Reset
         self.accumulated_weights_update *= 0
-        self.accumulated_bias_update[:] *= 0
+        self.accumulated_bias_update *= 0
         self.errors_received = 0
+
+
+class ActorCriticOutputLayer:
+    
+    def reset(self):
+        self.reward_trace = 0
+        self.previous_value_estimate = 0
+
+        self.previous_policy_grads = np.zeros(self.policy_num_outputs)
+        self.policy_grads = np.zeros(self.policy_num_outputs)
+        
+        self.policy_output.reset()
+        self.value_output.reset()
+
+    def __init__(
+        self,
+        num_hidden: int,
+        num_outputs: int,
+        connection_density: float,
+        learning_rate: float = 1e-3,
+        tau_out: float = 20e-3,
+        dt: float =1e-3,
+        policy_activation_function: str = "softmax",
+        gamma=0.99,
+        # Adam optimizer parameters
+        adam_beta1: float = 0.9,
+        adam_beta2: float = 0.999,
+        adam_epsilon: float = 1e-8,
+    ):
+        assert policy_activation_function in ["softmax", "linear"]
+        self.num_hidden = num_hidden
+        self.num_outputs = num_outputs
+
+        self.gamma = gamma
+        self.cv = 1
+
+        self.policy_num_outputs = num_outputs
+        use_bias = True
+        if policy_activation_function == "linear":
+            self.policy_num_outputs = 2*num_outputs
+            use_bias = True
+
+        self.policy_output: OutputLayer = OutputLayer(
+            num_hidden,
+            self.policy_num_outputs,
+            connection_density=connection_density,
+            activation_function=policy_activation_function,
+            rl_gamma=self.gamma,
+            tau_out=tau_out,
+            learning_rate=learning_rate,
+            use_bias=use_bias
+        )
+
+        self.value_output: OutputLayer = OutputLayer(
+            num_hidden,
+            1,
+            activation_function="linear",
+            connection_density=connection_density,
+            rl_gamma=self.gamma,
+            tau_out=tau_out,
+            learning_rate=10*learning_rate
+        )
+        self.reset()
+    
+    def receive_pulse(self, sparse_spike_vector: sp.csr_array):
+        self.policy_output.receive_pulse(sparse_spike_vector)
+        self.value_output.receive_pulse(sparse_spike_vector)
+    
+    def next_time_step(self):
+        self.policy_output.next_time_step()
+        self.value_output.next_time_step()
+
+    def _compute_log_normal_dist_policy_grad(self, action_taken, means, log_stds):
+        variances = np.exp(log_stds*2)
+
+        means_diff = action_taken - means
+        logp_gradient_means = - means_diff / variances
+        logp_gradient_logstds = 1 - (means_diff ** 2 / variances)
+
+        self.previous_policy_grads = self.policy_grads.copy()
+        self.policy_grads = np.concatenate([logp_gradient_means, 10*logp_gradient_logstds])
+        
+    def _compute_log_softmax_dist_policy_grad(self, p: np.ndarray, action_taken: np.ndarray):
+        self.previous_policy_grads = self.policy_grads.copy()
+        self.policy_grads = p - action_taken
+
+    def action(self):
+        output = self.policy_output.output()
+
+        if self.policy_output.activation_function == "linear":
+            means = output[:self.num_outputs]
+            log_stds = output[self.num_outputs:]
+            stds = np.exp(log_stds)
+
+            action = np.random.normal(means, stds)
+            # print("Action: ", action)
+            self._compute_log_normal_dist_policy_grad(action, means, log_stds)
+
+        elif self.policy_output.activation_function == "softmax":
+            action_index = np.random.choice(len(output), p=output)
+            action = np.zeros_like(output)
+            action[action_index] = 1.0
+            self._compute_log_softmax_dist_policy_grad(output, action)
+
+        # print(output)
+
+        return action
+
+    def td_error_update(self, reward: float):
+        value_estimate = self.value_output.output()[0]
+
+        current_state_td_error = (
+            self.previous_value_estimate
+            - self.gamma * value_estimate - reward
+        )
+        # Book formula for td error
+        previous_state_td_error = (
+            self.gamma * value_estimate + reward 
+            - self.previous_value_estimate
+        )
+
+        # print(f"PV: {self.previous_value_estimate:.3f}, V: {value_estimate:.3f}, R: {reward:.3f}, dt: {td_error:.3f}")
+        self.previous_value_estimate = value_estimate
+
+        self.policy_output.receive_error(
+            -previous_state_td_error * self.previous_policy_grads,
+            use_previous_state=True
+        )
+        self.value_output.receive_error(
+            -previous_state_td_error,
+            use_previous_state=True
+        )
+
+        self.policy_output.receive_error(
+            -current_state_td_error * self.policy_grads
+        )
+        self.value_output.receive_error(
+            -current_state_td_error
+        )
+
+
+        return (
+            self.policy_grads, current_state_td_error, 
+            self.previous_policy_grads, previous_state_td_error
+        )
+
+    def receive_reward(self, reward: float):
+        self.reward_trace = self.reward_trace * self.gamma + reward
+        value_estimate = self.value_output.output()[0]
+
+        advantage = np.mean(self.reward_trace - value_estimate)
+
+        # print("Learning signal: ", rl_learning_signal)
+        # print(f"V: {value_estimate}, R: {reward}, ADV: {advantage}")
+
+        self.policy_output.receive_error(
+            advantage * self.policy_grads
+        )
+        self.value_output.receive_error(
+            -advantage
+        )
+
+        return self.policy_grads, advantage
+    
+    def update_parameters(self):
+        self.policy_output.update_parameters()
+        self.value_output.update_parameters()

@@ -3,8 +3,7 @@ import scipy.sparse as sp
 import multiprocessing as mp
 import time
 
-from srnn import ALIFLayer, OutputLayer 
-
+from srnn import ALIFLayer, ActorCriticOutputLayer, OutputLayer
 
 class LocalBroadcastSrnn:
     def __init__(
@@ -15,17 +14,25 @@ class LocalBroadcastSrnn:
         hidden_connectivity=0.01,
         local_connectivity=0.1,
         output_connectivity=0.03,
+        how_many_outputs=1,
         layer_configs: list | None = None,
         output_activation_function: str = "softmax",
         tau_out: float = 30e-3,
+        tau: float = 200e-3,
         unary_weights: bool = False,
         self_predict: bool = False,
-        target_firing_rate: int = 13
+        target_firing_rate: int = 13,
+        default_learning_rate: float = 1e-3,
+        rl_gamma: float | None = None
     ):
         if layer_configs is None:
             layer_configs = [{} for _ in num_neurons_list]
         assert len(layer_configs) == len(num_neurons_list)
         assert all("num_neurons" not in l for l in layer_configs)
+
+        self.rl_gamma = rl_gamma
+
+        self.time_step = 0
 
         self.num_layers = len(num_neurons_list)
         self.num_neurons_list = num_neurons_list
@@ -33,6 +40,7 @@ class LocalBroadcastSrnn:
         self.output_size = output_size
 
         self.input_queues = [mp.Queue() for _ in range(self.num_layers)]
+        self.status_queues = [mp.Queue() for _ in range(self.num_layers)]
         self.output_queue = mp.Queue()
 
         self.processes = []
@@ -46,18 +54,30 @@ class LocalBroadcastSrnn:
             offset += n
         self.total_neurons = offset - input_size
         self.global_size = input_size + self.total_neurons
-        
+
+        self.lif_output_size = (
+            2*output_size 
+                if output_activation_function == "linear" and rl_gamma is not None
+                else output_size
+        )
+
         # Default LIFLayer parameters
         default_lif_kwargs = dict(
             just_input_size=input_size,
             num_inputs=self.global_size,
-            firing_threshold=1.0,
-            learning_rate=0.001,
+            firing_threshold=0.5,
+            learning_rate=default_learning_rate,
+            learned_loss_learning_rate=1e-3,
             input_connection_density=input_connectivity,
             hidden_connection_density=hidden_connectivity,
             local_connection_density=local_connectivity,
             self_predict=self_predict,
-            output_size=output_size,
+            output_sizes={
+                "base": self.output_size,
+                "policy": self.lif_output_size,
+                "value": 1
+            },
+            tau=tau,
             tau_out=tau_out,
             target_firing_rate=target_firing_rate,
             beta="sparse_adaptive",
@@ -79,23 +99,41 @@ class LocalBroadcastSrnn:
                     global_size=self.global_size,
                     left_input_queue=self.input_queues[i-1] if i > 0 else None,
                     right_input_queue=self.input_queues[i+1] if i < self.num_layers-1 else self.output_queue,
-                    output_queue=self.output_queue
+                    output_queue=self.output_queue,
+                    status_queue=self.status_queues[i]
                 )
             )
             p.start()
             self.processes.append(p)
 
         num_hidden = sum(num_neurons_list)
-        self.output_layer = OutputLayer(
-            num_hidden=input_size + num_hidden,
-            num_outputs=output_size,
-            learning_rate=0.001,
-            connection_density=output_connectivity,
-            activation_function=output_activation_function,
-            # input_offset=self.layers_offsets[-1]
-            unary_weights=unary_weights,
-            tau_out=tau_out
-        )
+        self.output_layers = []
+        for i in range(how_many_outputs):
+            if self.rl_gamma:
+                self.output_layers.append(ActorCriticOutputLayer(
+                    num_hidden=input_size + num_hidden,
+                    num_outputs=output_size,
+                    learning_rate=default_learning_rate,
+                    connection_density=output_connectivity,
+                    policy_activation_function=output_activation_function,
+                    # input_offset=self.layers_offsets[-1]
+                    # unary_weights=unary_weights,
+                    tau_out=tau_out,
+                    gamma=self.rl_gamma
+                ))
+            else:
+                self.output_layers.append(OutputLayer(
+                    num_hidden=input_size + num_hidden,
+                    num_outputs=output_size,
+                    learning_rate=default_learning_rate,
+                    connection_density=output_connectivity,
+                    activation_function=output_activation_function,
+                    # input_offset=self.layers_offsets[-1]
+                    # unary_weights=unary_weights,
+                    tau_out=tau_out,
+                    rl_gamma=self.rl_gamma
+                ))
+
 
         # print("OW:", self.output_layer.weights.nnz)
 
@@ -109,13 +147,15 @@ class LocalBroadcastSrnn:
             global_size,
             left_input_queue,
             right_input_queue,
-            output_queue
+            output_queue,
+            status_queue
         ): 
         np.random.seed((time.time_ns())%2**32)
         # beta = abs(np.random.random())
         # print(f"Random beta: {beta}")
         layer = ALIFLayer(**config, recurrent_start=layer_offset)
-        # print(layer.weights.nnz)
+        
+        print("Layer", layer.weights.nnz)
         last_time = time.time_ns()
         how_many = 0
         how_many_pulses = 0
@@ -128,8 +168,10 @@ class LocalBroadcastSrnn:
 
             # print(layer_id, instruction)
             match instruction:
+
                 case "STOP":
                     break
+
                 case "PULSE-R":
                     layer.receive_pulse(data)
                     right_pulses = right_pulses.maximum(data)
@@ -159,16 +201,23 @@ class LocalBroadcastSrnn:
                     if layer_id != 0:
                         left_input_queue.put(("PULSE-R", right_pulses))
                         # left_input_queue.put(("NEXT_TIME_STEP", None))
-                    
+                    status_queue.put(("DONE", None))
                     right_pulses = sp.csr_matrix((1, global_size))
                     left_pulses = sp.csr_matrix((1, global_size))
 
-                case "FEEDBACK":
+                case "RECEIVE ERROR":
                     layer.receive_error(data)
+
+                case "RECEIVE RL GRADIENT":
+                    layer.receive_rl_gradient(*data)
+
                 case "UPDATE":
+                    # print(f"FR: {1000*layer.firing_rate/layer.num_neurons:.3f} Hz")
                     layer.update_parameters()
+
                 case "OUTWEIGHTS":
                     layer.loss_weights[data.indices] = data[data.indices]
+
                 case "RESET":
                     how_many_pulses = 0
                     layer.reset()
@@ -185,43 +234,77 @@ class LocalBroadcastSrnn:
         self.input_queues[-1].put(("NEXT_TIME_STEP", None))
         # for q in self.input_queues[::-1]:
         #     q.put(("NEXT_TIME_STEP", None))
-        for q in self.input_queues[::-1]:
-            time.sleep(0.001)
-            while(not q.empty()):
-                pass
-        instruction, data = self.output_queue.get()
-        self.output_layer.receive_pulse(data)
-        self.output_layer.next_time_step()
+        for q in self.status_queues:
+            instruction, data = q.get()
+            assert instruction == "DONE"
 
+        instruction, data = self.output_queue.get()
+
+        for output_layer in self.output_layers:
+            output_layer.receive_pulse(data)
+            output_layer.next_time_step()
+
+        self.time_step += 1
 
     def output(self):
-        return self.output_layer.output()
+        return [output_layer.output() for output_layer in self.output_layers]
     
-    def feedback(self, label):
-        errors = self.output_layer.compute_error(label)
-        loss = self.output_layer.compute_loss(label)
-        for q in self.input_queues:
-            q.put(("FEEDBACK", errors))
+    def action(self):
+        return [output_layer.action() for output_layer in self.output_layers]
+
+    def td_error_update(self, reward: float):
+        total_td_error = 0
+        for output_layer in self.output_layers:
+            policy_gradient, this_state_td_error, previous_policy_grads, previous_state_td_error = output_layer.td_error_update(reward)
+            total_td_error += this_state_td_error
+            for i, q in enumerate(self.input_queues[::-1]):
+                if self.time_step >= (i-1)*2:
+                    #print(f"Sending RL gradient to layer {i}, time step {self.time_step}")
+                    q.put(("RECEIVE RL GRADIENT", 
+                        (self.time_step-i, policy_gradient, this_state_td_error, 
+                    previous_policy_grads, previous_state_td_error)))
+        return total_td_error/len(self.output_layers)
+        
+    def receive_reward(self, reward: float):
+        total_advantage = 0
+        for output_layer in self.output_layers:
+            policy_gradient, advantage = output_layer.receive_reward(reward)
+            total_advantage += advantage
+            for i, q in enumerate(self.input_queues[::-1]):
+                if self.time_step >= (i-1)*2:
+                    q.put(("RECEIVE RL GRADIENT", 
+                        (self.time_step-i, policy_gradient, advantage, policy_gradient*0, advantage*0))
+                    )
+        return advantage
+    
+    def receive_feedback(self, target):
+        errors = self.output_layer[0].compute_error(target)
+        loss = self.output_layer.compute_loss(target)
+        for i, q in enumerate(self.input_queues[::-1]):
+            if self.time_step >= (i-1)*2:
+                q.put(("RECEIVE ERROR", errors))
         self.output_layer.receive_error(errors)
         return loss
     
     def update_parameters(self):
         for q in self.input_queues:
             q.put(("UPDATE", None))
-        self.output_layer.update_parameters()
+        for o in self.output_layers:
+            o.update_parameters()
     
-    def update_outweights(self):
-        for i, q in enumerate(self.input_queues):
-            start = self.layers_offsets[i]
-            end = start + self.num_neurons_list[i]
-            out_w = self.output_layer.weights[:, start:end].T  # shape: (layer_size, num_outputs)
-            q.put(("OUTWEIGHTS", out_w))
+    # def update_outweights(self):
+    #     for i, q in enumerate(self.input_queues):
+    #         start = self.layers_offsets[i]
+    #         end = start + self.num_neurons_list[i]
+    #         out_w = self.output_layer.weights[:, start:end].T  # shape: (layer_size, num_outputs)
+    #         q.put(("OUTWEIGHTS", out_w))
     
     def reset(self):
+        self.time_step = 0
         for q in self.input_queues:
             q.put(("RESET", None))
-        self.output_layer.reset()
-        # print(self.output_queue.qsize())
+        for o in self.output_layers:
+            o.reset()
 
     def shutdown(self):
     #     for q in self.input_queues:
