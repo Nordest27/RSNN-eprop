@@ -217,6 +217,9 @@ class ALIFLayer:
             raise ValueError("Invalid beta parameter type")
 
     def reset(self):
+        if self.time_step > 1:
+            self.compute_elegibility_traces()
+            
         self.membrane_potentials = np.zeros(self.num_neurons)
         self.sending_pulses = np.zeros(self.num_neurons, dtype=bool)
         self.refractory_periods = np.zeros(self.num_neurons, dtype=int)
@@ -422,6 +425,7 @@ class ALIFLayer:
         self.adam_beta2 = adam_beta2
         self.adam_epsilon = adam_epsilon
 
+        self.time_step = 1
         self.full_reset()
 
     @profile
@@ -588,7 +592,7 @@ class ALIFLayer:
             )
     
     @profile
-    def compute_elegibility_traces(self, base_loss_weights_name: str):
+    def compute_elegibility_traces(self, base_loss_weights_name: str = "base"):
         # Update eligibility vectors
         pseudo_derivatives = []
         voltage_errors = []
@@ -949,6 +953,7 @@ class ActorCriticOutputLayer:
     
     def reset(self):
         self.reward_trace = 0
+        self.value_estimate = 0
         self.previous_value_estimate = 0
 
         self.previous_policy_grads = np.zeros(self.policy_num_outputs)
@@ -1015,6 +1020,9 @@ class ActorCriticOutputLayer:
         self.policy_output.next_time_step()
         self.value_output.next_time_step()
 
+        self.previous_value_estimate = self.value_estimate
+        self.value_estimate = self.value_output.output()[0]
+
     def _compute_log_normal_dist_policy_grad(self, action_taken, means, log_stds):
         variances = np.exp(log_stds*2)
 
@@ -1052,21 +1060,17 @@ class ActorCriticOutputLayer:
         return action
 
     def td_error_update(self, reward: float):
-        value_estimate = self.value_output.output()[0]
-
         current_state_td_error = (
             self.previous_value_estimate
-            - self.gamma * value_estimate - reward
+            - self.gamma * self.value_estimate - reward
         )
         # Book formula for td error
         previous_state_td_error = (
-            self.gamma * value_estimate + reward 
+            self.gamma * self.value_estimate + reward 
             - self.previous_value_estimate
         )
 
         # print(f"PV: {self.previous_value_estimate:.3f}, V: {value_estimate:.3f}, R: {reward:.3f}, dt: {td_error:.3f}")
-        self.previous_value_estimate = value_estimate
-
         self.policy_output.receive_error(
             -previous_state_td_error * self.previous_policy_grads,
             use_previous_state=True

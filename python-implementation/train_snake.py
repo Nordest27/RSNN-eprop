@@ -6,7 +6,7 @@ import cv2
 import matplotlib.pyplot as plt
 from local_broadcast_srnn import LocalBroadcastSrnn
 
-BOARD_SIZE = 5
+BOARD_SIZE = 6
 VISIBLE_RANGE = 5
 INPUT_SIZE = 3 * VISIBLE_RANGE**2
 
@@ -32,7 +32,7 @@ def build_agent():
         how_many_outputs=1,
         rl_gamma=0.99,
         default_learning_rate=1e-3,
-        target_firing_rate=50,
+        # target_firing_rate=100,
         tau=20e-3,
         tau_out=10e-3,
         tau_adaptation=200e-3,
@@ -123,9 +123,11 @@ def train_snake_agent(episodes=100000):
 
             obs, reward, done = env.step(action_label)
             total_reward += reward
-
-            td = agent.td_error_update(reward)
-            # td = agent.receive_reward(reward)
+            
+            td = 0
+            if reward != 0:
+                td = agent.td_error_update(reward)
+                # td = agent.receive_reward(reward)
 
             if env.wait_count == env.wait_inc:
                 # agent.reset()
@@ -138,8 +140,8 @@ def train_snake_agent(episodes=100000):
             total_td += td
             frame += 1
         
-        agent.update_parameters()
         agent.reset()
+        agent.update_parameters()
 
         # --- Update if new best run ---
         if total_reward >= best_reward:
@@ -180,6 +182,7 @@ def train_snake_agent(episodes=100000):
         running_avg.append(avg)
 
         if ep % 10 == 0:
+            # agent.update_parameters()
             reward_history = reward_history[-200:]
             running_avg = running_avg[-200:]
             axis = range(ep - len(reward_history), ep)

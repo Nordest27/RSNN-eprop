@@ -14,7 +14,15 @@ class SnakeEnv:
         self.reset()
 
     def reset(self):
-        self.snake = [(self.size // 2, self.size // 2)]
+        self.snake = [
+            #     [
+            #     (self.size // 2 - 1, self.size // 2),
+            #     (self.size // 2 + 1, self.size // 2),
+            #     (self.size // 2, self.size // 2 + 1),
+            #     (self.size // 2, self.size // 2 - 1),
+            # ][random.randint(0, 3)],
+            (self.size // 2, self.size // 2)
+        ]
 
         self.dir_idx = 1
         self.direction = 'up'
@@ -29,8 +37,8 @@ class SnakeEnv:
     def spawn_apples(self):
         empty_cells = [(i, j) for i in range(self.size)
                        for j in range(self.size) if (i, j) not in self.snake and (i, j) not in self.apples]
-        if np.ceil(np.sqrt(len(empty_cells))) > len(self.apples):
-            self.apples.extend(random.sample(empty_cells, k=int(np.ceil(np.sqrt(len(empty_cells))) - len(self.apples))))
+        if max(np.ceil(np.log10(len(empty_cells))), 1) > len(self.apples):
+            self.apples.extend(random.sample(empty_cells, k=int(max(np.ceil(np.log10(len(empty_cells))), 1) - len(self.apples))))
         if (empty_cells) == 0:
             self.done = True
         #self.apple = empty_cells[15%len(empty_cells)]
@@ -44,11 +52,14 @@ class SnakeEnv:
             self.wait_count -= 1
             return self.get_observation(), 0.0, self.done
 
+
         dirs = ['left', 'up', 'right', 'down']
+        # self.dir_idx = (self.dir_idx + (action-1)) % 4
+        # new_dir = dirs[self.dir_idx]
         new_dir = dirs[action]
+
         
         reward = -1.0
-
         # if (self.direction == 'up' and new_dir == 'down') or \
         #    (self.direction == 'down' and new_dir == 'up') or \
         #    (self.direction == 'left' and new_dir == 'right') or \
@@ -106,11 +117,8 @@ class SnakeEnv:
 
         if self.steps_since_last_apple > self.size**2:
             self.done = True
-            return self.get_observation(), 0.0, True
+            return self.get_observation(), 0.0, self.done
     
-        # reward = 0
-        # if self.direction == "right":
-        #     reward = 1
         self.wait_count = self.wait_inc
 
         return self.get_observation(), reward/100, self.done
@@ -142,7 +150,7 @@ class SnakeEnv:
                     continue
 
                 # body
-                if (y, x) in self.snake[1:]:
+                if (y, x) in self.snake:
                     obs[0, local_y, local_x] = 1.0
 
                 # # head
@@ -204,8 +212,9 @@ class SnakeEnv:
                     img[local_y, local_x] = [0, 155, 0]
 
                 # apple
-                if (y, x) == self.apple:
-                    img[local_y, local_x] = [0, 0, 255]
+                for apple in self.apples:
+                    if (y, x) == apple:
+                        img[local_y, local_x] = [0, 0, 255]
 
         # upscale for visualization
         return cv2.resize(img, (v * scale, v * scale), interpolation=cv2.INTER_NEAREST)
