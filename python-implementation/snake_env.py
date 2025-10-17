@@ -31,16 +31,16 @@ class SnakeEnv:
         self.spawn_apples()
         self.done = False
         self.steps_since_last_apple = 0
-        self.wait_count = 0
+        self.wait_count = self.wait_inc
         return self.get_observation()
 
     def spawn_apples(self):
         empty_cells = [(i, j) for i in range(self.size)
                        for j in range(self.size) if (i, j) not in self.snake and (i, j) not in self.apples]
-        if max(np.ceil(np.log10(len(empty_cells))), 1) > len(self.apples):
-            self.apples.extend(random.sample(empty_cells, k=int(max(np.ceil(np.log10(len(empty_cells))), 1) - len(self.apples))))
-        if (empty_cells) == 0:
+        if len(empty_cells) == 0:
             self.done = True
+        elif max(np.ceil(np.log10(len(empty_cells))), 1) > len(self.apples):
+            self.apples.extend(random.sample(empty_cells, k=int(max(np.ceil(np.log10(len(empty_cells))), 1) - len(self.apples))))
         #self.apple = empty_cells[15%len(empty_cells)]
 
     def step(self, action):
@@ -50,7 +50,8 @@ class SnakeEnv:
         
         if self.wait_count > 0:
             self.wait_count -= 1
-            return self.get_observation(), 0.0, self.done
+            reward = 0.0
+            return self.get_observation(), reward/100, self.done
 
 
         dirs = ['left', 'up', 'right', 'down']
@@ -59,13 +60,13 @@ class SnakeEnv:
         new_dir = dirs[action]
 
         
-        reward = -1.0
-        # if (self.direction == 'up' and new_dir == 'down') or \
-        #    (self.direction == 'down' and new_dir == 'up') or \
-        #    (self.direction == 'left' and new_dir == 'right') or \
-        #    (self.direction == 'right' and new_dir == 'left'):
-        #     reward -= 10
-        #     new_dir = self.direction
+        reward = 0.0
+        if (self.direction == 'up' and new_dir == 'down') or \
+           (self.direction == 'down' and new_dir == 'up') or \
+           (self.direction == 'left' and new_dir == 'right') or \
+           (self.direction == 'right' and new_dir == 'left'):
+            reward -= 10
+            new_dir = self.direction
 
         self.direction = new_dir
 

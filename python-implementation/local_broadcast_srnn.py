@@ -258,14 +258,13 @@ class LocalBroadcastSrnn:
     def td_error_update(self, reward: float):
         total_td_error = 0
         for output_layer in self.output_layers:
-            policy_gradient, this_state_td_error, previous_policy_grads, previous_state_td_error = output_layer.td_error_update(reward)
-            total_td_error += this_state_td_error
+            policy_gradient, td_error = output_layer.td_error_update(reward)
+            total_td_error += td_error
             for i, q in enumerate(self.input_queues[::-1]):
                 if self.time_step >= (i-1)*2:
                     #print(f"Sending RL gradient to layer {i}, time step {self.time_step}")
                     q.put(("RECEIVE RL GRADIENT", 
-                        (self.time_step-i, policy_gradient, this_state_td_error, 
-                    previous_policy_grads, previous_state_td_error)))
+                        (self.time_step-i, policy_gradient, td_error)))
         return total_td_error/len(self.output_layers)
         
     def receive_reward(self, reward: float):

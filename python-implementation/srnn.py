@@ -554,42 +554,33 @@ class ALIFLayer:
 
         return derivatives
     
-    def compute_rl_learning_signal(
-        self, signal_time_step, 
-        low_pass_eligibility_traces,
-        previous_low_pass_eligibility_traces,
-        policy_loss_weights_name="policy",
-        value_loss_weights_name="value",
+    # def compute_rl_learning_signal(
+    #     self, signal_time_step, 
+    #     low_pass_eligibility_traces,
+    #     previous_low_pass_eligibility_traces,
+    #     policy_loss_weights_name="policy",
+    #     value_loss_weights_name="value",
 
-    ):
-        if signal_time_step in self.rl_signals_record:
-            (
-                policy_gradient, this_state_td_error, 
-                previous_policy_grads, previous_state_td_error
-            ) = self.rl_signals_record[signal_time_step]
+    # ):
+    #     if signal_time_step in self.rl_signals_record:
+    #         (policy_gradient, td_error) = self.rl_signals_record[signal_time_step]
 
-            rl_learning_signal = - this_state_td_error * (
-                (self.loss_weights_dict[policy_loss_weights_name] @ policy_gradient)
-                - self.loss_weights_dict[value_loss_weights_name].todense().reshape(-1)
-            )
-            rl_previous_learning_signal = - previous_state_td_error * (
-                (self.loss_weights_dict[policy_loss_weights_name] @ previous_policy_grads)
-                - self.loss_weights_dict[value_loss_weights_name].todense().reshape(-1)
-            )
-            # self.learned_losses_weights_update += -self.learned_loss_learning_rate * (
-            #     (np.sum(rl_learning_signal.reshape(-1, 1) 
-            #     * self.low_pass_eligibility_traces
-            #     * prev_low_pass_e_trace, axis=1) *
-            #     self.learned_losses_active_connections.T)
-            # ).T
+    #         rl_output_regularization = - td_error * (
+    #             self.loss_weights_dict[value_loss_weights_name].todense().reshape(-1)
+    #         )
 
-            self.base_weights_update += (
-                rl_learning_signal.reshape(-1, 1) 
-                * low_pass_eligibility_traces
-            ) + (
-                rl_previous_learning_signal.reshape(-1, 1)
-                * previous_low_pass_eligibility_traces
-            )
+    #         rl_learning_signal = -td_error * (
+    #             (self.loss_weights_dict[policy_loss_weights_name] @ policy_gradient)
+    #             - self.loss_weights_dict[value_loss_weights_name].todense().reshape(-1)
+    #         )
+
+    #         self.base_weights_update += (
+    #             rl_output_regularization.reshape(-1, 1) 
+    #             * low_pass_eligibility_traces
+    #         ) + (
+    #             rl_learning_signal.reshape(-1, 1)
+    #             * previous_low_pass_eligibility_traces
+    #         )
     
     @profile
     def compute_elegibility_traces(self, base_loss_weights_name: str = "base"):
@@ -637,8 +628,22 @@ class ALIFLayer:
                 self.low_pass_active_connections
                 - self.adaptative_eligibility_vector * self.betas_col
             )
-            
-            self.previous_low_pass_eligibility_traces = self.low_pass_eligibility_traces.copy()
+
+            # Use previous low pass eligibility traces
+            policy_gradient, td_error = None, None
+            if t in self.rl_signals_record:
+                (policy_gradient, td_error) = self.rl_signals_record[t]
+
+                rl_learning_signal = -td_error * (
+                    (self.loss_weights_dict["policy"] @ policy_gradient)
+                    - self.loss_weights_dict["value"].todense().reshape(-1)
+                )
+
+                self.base_weights_update += (
+                    rl_learning_signal.reshape(-1, 1)
+                    * self.low_pass_eligibility_traces
+                )
+
             self.low_pass_eligibility_traces = (
                 self.low_pass_eligibility_traces * self.kappa + elegibility_vector * pd
             )
@@ -651,12 +656,11 @@ class ALIFLayer:
             if err is not None:
                 learning_signal = self.loss_weights_dict[base_loss_weights_name] @ err
 
-            # self.learned_losses_weights_update += -self.learned_loss_learning_rate * (
-            #     (np.sum(learning_signal.reshape(-1, 1) 
-            #     * self.low_pass_eligibility_traces
-            #     * prev_low_pass_e_trace, axis=1) *
-            #     self.learned_losses_active_connections.T)
-            # ).T
+            if policy_gradient is not None and td_error is not None:
+                rl_output_regularization = - td_error * (
+                    self.loss_weights_dict["value"].todense().reshape(-1)
+                )
+                learning_signal += rl_output_regularization
             
             self.base_weights_update += (
                 # self.firing_rate_error * self.low_pass_eligibility_traces
@@ -664,10 +668,10 @@ class ALIFLayer:
                 # Voltage Regularization
                 + 0.1 * ve.reshape(-1, 1) * elegibility_vector
             )
-            self.compute_rl_learning_signal(
-                t, self.low_pass_eligibility_traces,
-                self.previous_low_pass_eligibility_traces
-            )
+            # self.compute_rl_learning_signal(
+            #     t, self.low_pass_eligibility_traces,
+            #     self.previous_low_pass_eligibility_traces
+            # )
 
             # print(sum(abs(ve)))
                 
@@ -702,15 +706,12 @@ class ALIFLayer:
     def receive_rl_gradient(
         self, 
         signal_time_step,
-        policy_gradient, this_state_td_error, 
-        previous_policy_grads, previous_state_td_error
+        policy_gradient, td_error
     ):
         self.rl_signals_record[signal_time_step] = (
-            policy_gradient, this_state_td_error, 
-            previous_policy_grads, previous_state_td_error
+            policy_gradient, td_error
         )
-
-        return this_state_td_error
+        return td_error
 
     # def receive_loss_signal(
     #     self, loss_signal, 
@@ -981,6 +982,7 @@ class ActorCriticOutputLayer:
         self.num_hidden = num_hidden
         self.num_outputs = num_outputs
 
+        self.dt = dt
         self.gamma = gamma
         self.cv = 1
 
@@ -1030,11 +1032,9 @@ class ActorCriticOutputLayer:
         logp_gradient_means = - means_diff / variances
         logp_gradient_logstds = 1 - (means_diff ** 2 / variances)
 
-        self.previous_policy_grads = self.policy_grads.copy()
         self.policy_grads = np.concatenate([logp_gradient_means, 10*logp_gradient_logstds])
         
     def _compute_log_softmax_dist_policy_grad(self, p: np.ndarray, action_taken: np.ndarray):
-        self.previous_policy_grads = self.policy_grads.copy()
         self.policy_grads = p - action_taken
 
     def action(self):
@@ -1060,37 +1060,26 @@ class ActorCriticOutputLayer:
         return action
 
     def td_error_update(self, reward: float):
-        current_state_td_error = (
-            self.previous_value_estimate
-            - self.gamma * self.value_estimate - reward
-        )
-        # Book formula for td error
-        previous_state_td_error = (
+        td_error = (
             self.gamma * self.value_estimate + reward 
             - self.previous_value_estimate
         )
 
         # print(f"PV: {self.previous_value_estimate:.3f}, V: {value_estimate:.3f}, R: {reward:.3f}, dt: {td_error:.3f}")
-        self.policy_output.receive_error(
-            -previous_state_td_error * self.previous_policy_grads,
-            use_previous_state=True
-        )
-        self.value_output.receive_error(
-            -previous_state_td_error,
-            use_previous_state=True
-        )
+        self.policy_output.receive_error(td_error * self.policy_grads, use_previous_state=True)
+        self.value_output.receive_error(-td_error, use_previous_state=True)
 
-        self.policy_output.receive_error(
-            -current_state_td_error * self.policy_grads
-        )
-        self.value_output.receive_error(
-            -current_state_td_error
-        )
+        # self.policy_output.receive_error(
+        #     -current_state_td_error * self.policy_grads
+        # )
 
+        # Regularization for the accuracy in the output layer
+        self.value_output.receive_error(
+            td_error
+        )
 
         return (
-            self.policy_grads, current_state_td_error, 
-            self.previous_policy_grads, previous_state_td_error
+            self.policy_grads, td_error
         )
 
     def receive_reward(self, reward: float):

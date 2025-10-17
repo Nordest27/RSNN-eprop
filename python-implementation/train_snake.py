@@ -6,7 +6,7 @@ import cv2
 import matplotlib.pyplot as plt
 from local_broadcast_srnn import LocalBroadcastSrnn
 
-BOARD_SIZE = 6
+BOARD_SIZE = 4
 VISIBLE_RANGE = 5
 INPUT_SIZE = 3 * VISIBLE_RANGE**2
 
@@ -95,34 +95,31 @@ def train_snake_agent(episodes=100000):
         current_probs = []
         total_td = 0
         frame = 0
-        
-        input_vec = np.zeros((1, agent.total_neurons + agent.input_size), dtype=np.float32)
-        input_vec[0, :INPUT_SIZE] = obs
-        input_csr = sp.csr_matrix(input_vec)
-
-        for _ in range(8):
-            agent.input(input_csr)
 
         while not done:
+
+            action_label = 0
+            if env.wait_count == 0:       
+                current_probs.append(agent.output_layers[0].policy_output.output())
+                current_values.append(agent.output_layers[0].value_output.output()[0])
+
+                action = agent.action()
+
+                possible_actions = np.sum(action, axis=0)
+                most_voted_actions = [
+                    ai for ai in range(len(possible_actions))
+                    if possible_actions[ai] == max(possible_actions)
+                ]
+                action_label = np.random.choice(most_voted_actions)
+
+            obs, reward, done = env.step(action_label)
+            total_reward += reward
+
             input_vec = np.zeros((1, agent.total_neurons + agent.input_size), dtype=np.float32)
             input_vec[0, :INPUT_SIZE] = obs
             input_csr = sp.csr_matrix(input_vec)
 
             agent.input(input_csr)
-
-            action = agent.action()
-            current_probs.append(agent.output_layers[0].policy_output.output())
-            current_values.append(agent.output_layers[0].value_output.output()[0])
-
-            possible_actions = np.sum(action, axis=0)
-            most_voted_actions = [
-                ai for ai in range(len(possible_actions))
-                if possible_actions[ai] == max(possible_actions)
-            ]
-            action_label = np.random.choice(most_voted_actions)
-
-            obs, reward, done = env.step(action_label)
-            total_reward += reward
             
             td = 0
             if reward != 0:
@@ -181,7 +178,7 @@ def train_snake_agent(episodes=100000):
             avg = smoothing * avg + (1 - smoothing) * total_reward
         running_avg.append(avg)
 
-        if ep % 10 == 0:
+        if ep % 1 == 0:
             # agent.update_parameters()
             reward_history = reward_history[-200:]
             running_avg = running_avg[-200:]
